@@ -251,27 +251,17 @@ def run_inference_benchmark(
     compiled_varlen_dec = None
     compiled_batched_dec = None
     if include_compile:
-        @_compile_or_warn(
-            lambda q, k, v, cu, mx, c, s: varlen_flash_decode(q, k, v, cu, max_seqlen_k=mx, cos=c, sin=s),
-            "varlen_flash_decode",
-        )
         def _c_varlen_dec(q_in, k_in, v_in, cu_in, max_k, c_in, s_in):
             return varlen_flash_decode(q_in, k_in, v_in, cu_in, max_seqlen_k=max_k, cos=c_in, sin=s_in)
 
-        compiled_varlen_dec = _c_varlen_dec
+        compiled_varlen_dec = _compile_or_warn(_c_varlen_dec, "varlen_flash_decode")
 
-        @_compile_or_warn(
-            lambda q, k, v, mask, sc, rep_k: F.scaled_dot_product_attention(
-                q, _repeat_kv_batched(k, rep_k), _repeat_kv_batched(v, rep_k), attn_mask=mask, scale=sc
-            ),
-            "batched_sdpa_decode",
-        )
         def _c_batched_dec(q_b, k_b, v_b, pad_m, sc_val, rep_val):
             k_exp = _repeat_kv_batched(k_b, rep_val)
             v_exp = _repeat_kv_batched(v_b, rep_val)
             return F.scaled_dot_product_attention(q_b, k_exp, v_exp, attn_mask=pad_m, scale=sc_val)
 
-        compiled_batched_dec = _c_batched_dec
+        compiled_batched_dec = _compile_or_warn(_c_batched_dec, "batched_sdpa_decode")
 
     decode_results: List[Dict[str, Any]] = []
     decode_rows: List[List[str]] = []
@@ -449,21 +439,6 @@ def run_inference_benchmark(
     compiled_varlen_step_fn = None
     compiled_batched_step_fn = None
     if include_compile:
-        @_compile_or_warn(
-            lambda x_st, k_c, v_c, cu_c, mx_k, c_t, s_t, off_t: mod_varlen.out_proj(
-                varlen_flash_decode(
-                    mod_varlen._project_qkv_decode(x_st)[0],
-                    k_c,
-                    v_c,
-                    cu_c,
-                    max_seqlen_k=mx_k,
-                    cos=c_t,
-                    sin=s_t,
-                    offsets=off_t,
-                ).transpose(0, 1).contiguous().view(x_st.shape[0], -1)
-            ),
-            "varlen_decode_step",
-        )
         def _c_varlen_step(x_step, k_cache, v_cache, cu_seqlens_k, max_k, cos_t, sin_t, offsets_t):
             q, new_k, new_v = mod_varlen._project_qkv_decode(x_step)
             attn_out = varlen_flash_decode(
@@ -472,22 +447,8 @@ def run_inference_benchmark(
             out_flat = attn_out.transpose(0, 1).contiguous().view(x_step.shape[0], -1)
             return mod_varlen.out_proj(out_flat), new_k, new_v
 
-        compiled_varlen_step_fn = _c_varlen_step
+        compiled_varlen_step_fn = _compile_or_warn(_c_varlen_step, "varlen_decode_step")
 
-        @_compile_or_warn(
-            lambda x_st, p_k, p_v, off_v: mod_batched.out_proj(
-                F.scaled_dot_product_attention(
-                    (mod_batched.rope(
-                        mod_batched.qkv_proj(x_st).view(x_st.shape[0], 1, -1, mod_batched.head_dim).transpose(1, 2).split([mod_batched.num_heads_q, mod_batched.num_heads_kv, mod_batched.num_heads_kv], dim=1)[0],
-                        offset=off_v
-                    ) if mod_batched.rope is not None else mod_batched.qkv_proj(x_st).view(x_st.shape[0], 1, -1, mod_batched.head_dim).transpose(1, 2).split([mod_batched.num_heads_q, mod_batched.num_heads_kv, mod_batched.num_heads_kv], dim=1)[0]),
-                    _repeat_kv_batched(torch.cat([p_k, mod_batched.qkv_proj(x_st).view(x_st.shape[0], 1, -1, mod_batched.head_dim).transpose(1, 2).split([mod_batched.num_heads_q, mod_batched.num_heads_kv, mod_batched.num_heads_kv], dim=1)[1]], dim=2), rep_gqa),
-                    _repeat_kv_batched(torch.cat([p_v, mod_batched.qkv_proj(x_st).view(x_st.shape[0], 1, -1, mod_batched.head_dim).transpose(1, 2).split([mod_batched.num_heads_q, mod_batched.num_heads_kv, mod_batched.num_heads_kv], dim=1)[2]], dim=2), rep_gqa),
-                    scale=scale,
-                ).transpose(1, 2).contiguous().view(x_st.shape[0], 1, -1)
-            ),
-            "batched_decode_step",
-        )
         def _c_batched_step(x_step, past_k, past_v, offset_val):
             qkv = mod_batched.qkv_proj(x_step)
             B_sz = x_step.shape[0]
@@ -504,7 +465,7 @@ def run_inference_benchmark(
             out_flat = out.transpose(1, 2).contiguous().view(B_sz, 1, -1)
             return mod_batched.out_proj(out_flat), k_all, v_all
 
-        compiled_batched_step_fn = _c_batched_step
+        compiled_batched_step_fn = _compile_or_warn(_c_batched_step, "batched_decode_step")
 
     # Default expanded evaluation matrix covering small/medium/large batches and contexts
     if e2e_configs is None:
