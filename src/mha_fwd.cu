@@ -528,7 +528,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
 
     TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "q, k, v must be 3D tensors (H, Total_L, D)");
     TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1, "cu_seqlens_q and cu_seqlens_k must be 1D tensors");
-    TORCH_CHECK(cu_seqlens_q.size(0) == cu_seqlens_k.size(0) && cu_seqlens_q.size(0) >= 2, "cu_seqlens_q and cu_seqlens_k must have identical length >= 2");
+    TORCH_CHECK(cu_seqlens_q.size(0) == cu_seqlens_k.size(0) && cu_seqlens_q.size(0) >= 1, "cu_seqlens_q and cu_seqlens_k must have identical length >= 1");
 
     const int64_t H_q      = q.size(0);
     const int64_t Total_Lq = q.size(1);
@@ -554,7 +554,10 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
         TORCH_CHECK(cos->scalar_type() == at::kHalf && sin->scalar_type() == at::kHalf, "cos and sin must be float16");
         TORCH_CHECK(cos->dim() == 2 && sin->dim() == 2, "cos and sin must be 2D tensors (L_max, 64)");
         TORCH_CHECK(cos->size(1) == 64 && sin->size(1) == 64, "cos and sin last dimension must be 64");
-        TORCH_CHECK(cos->size(0) == sin->size(0) && cos->size(0) > 0, "cos and sin must have matching positive L_max");
+        TORCH_CHECK(cos->size(0) == sin->size(0), "cos and sin must have matching L_max");
+        if (Total_Lq > 0 || Total_Lk > 0) {
+            TORCH_CHECK(cos->size(0) > 0, "cos and sin must have positive L_max for non-empty sequences");
+        }
         l_max = cos->size(0);
     }
 
@@ -569,13 +572,16 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     // -------------------------------------------------------------------------------------
     // Giai đoạn 2: Quy trình Khởi chạy Kernel 8 bước (Rule 5, 8, 10, 11, 15, 16)
     // -------------------------------------------------------------------------------------
-    // Bước 1: Cấp phát trước tensor output o (FP16) và lse (FP32)
+    // Bước 1: Xử lý trường hợp biên rỗng và cấp phát trước tensor output o (FP16), lse (FP32)
+    if (Total_Lq == 0 || max_seqlen_q <= 0 || B <= 0) {
+        return std::make_tuple(
+            torch::zeros_like(q),
+            torch::full({H_q, Total_Lq}, -std::numeric_limits<float>::infinity(), q.options().dtype(at::kFloat))
+        );
+    }
+
     at::Tensor o   = torch::empty_like(q);
     at::Tensor lse = torch::empty({H_q, Total_Lq}, q.options().dtype(at::kFloat));
-
-    if (Total_Lq == 0 || max_seqlen_q <= 0 || B <= 0) {
-        return std::make_tuple(o, lse);
-    }
 
     // Bước 2: Hằng số & Cấu hình Launch
     using Element = cutlass::half_t;
