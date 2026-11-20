@@ -244,6 +244,27 @@ class VarlenKVCache:
             self.max_seqlen_k += 1
 
 
+try:
+    from torch.utils._pytree import register_pytree_node
+
+    def _varlen_kv_cache_flatten(cache: "VarlenKVCache"):
+        flat_tensors = [cache.k_cache, cache.v_cache, cache.cu_seqlens_k]
+        if cache.offsets is not None:
+            flat_tensors.append(cache.offsets)
+        context = (cache.max_seqlen_k, cache.offsets is not None)
+        return flat_tensors, context
+
+    def _varlen_kv_cache_unflatten(flat_tensors, context):
+        max_seqlen_k, has_offsets = context
+        k, v, cu = flat_tensors[0], flat_tensors[1], flat_tensors[2]
+        offsets = flat_tensors[3] if has_offsets else None
+        return VarlenKVCache(k, v, cu, max_seqlen_k=max_seqlen_k, offsets=offsets)
+
+    register_pytree_node(VarlenKVCache, _varlen_kv_cache_flatten, _varlen_kv_cache_unflatten)
+except Exception:
+    pass
+
+
 # =========================================================================================
 # Pure-PyTorch Varlen Reference Functions (for Correctness Verification)
 # =========================================================================================

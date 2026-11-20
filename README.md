@@ -13,9 +13,10 @@ High-performance **Variable-Length FlashAttention**, **Fused RoPE**, and **Split
   - **Backward (`src/mha_bwd.cu`)**: `64x64x64` tiling (`Grid = (cdiv(max_seqlen_k, 64), B, H_kv)`), `57,600 B` (`56.25 KB`) bank-conflict-free swizzled dynamic SMEM, `FP32` register accumulation for `dK`/`dV` across GQA groups (atomic-free), and `FP32`-staged RoPE backward + `atomicAdd` for `dQ`.
   - **Flash Decoding (`src/mha_decode.cu`)**: Dynamic `num_splits` via `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, 2-stage Register Prefetch (no MMA), Method 2 raw unrotated `k_cache` (rotates both `q` at `offset + lk_i - 1` and `k_cache` at `offset + t`), `--use_fast_math`-safe finite sentinels, and zero-SMEM Split-K LSE reduction.
 - **Full `torch.compile` / TorchInductor Compatibility**: Custom ops registered under `TORCH_LIBRARY(varlen_transformer, ...)` with `SymInt`-safe `FakeTensor` kernels (`register_fake`) and `torch.autograd.Function`.
-- **Dual Baselines**:
+- **Dual Baselines & TorchInductor Reference**:
+  - `BatchedFlashGQABaselineSpeed` with `torch.compile(backend="inductor", dynamic=True)`: Primary speed baseline for batched training and inference benchmarks.
+  - `VarlenFlashGQA` with `torch.compile`: Benchmarked directly against the compiled baseline via registered FakeTensors.
   - `VarlenFlashGQABaselineCorrectness`: Pure-PyTorch packed varlen reference (with autograd) for exact numerical verification.
-  - `BatchedFlashGQABaselineSpeed`: Optimized padded batched `F.scaled_dot_product_attention` baseline for speed & VRAM comparison.
 
 ---
 
@@ -137,11 +138,13 @@ Run the full verification and benchmark suite on a CUDA GPU:
 # 1. Numerical correctness (Fwd, Bwd, Decode, E2E GQA, VarlenKVCache, torch.compile)
 python tests/test_correctness.py
 
-# 2. Training (Fwd & Fwd+Bwd) speed & VRAM vs Batched SDPA
+# 2. Training (Fwd & Fwd+Bwd) speed & VRAM vs torch.compile Baseline
 python tests/bench_training.py --save-plot assets/training_benchmark.png
 
-# 3. Inference (Cold-L2 Decode L=1 & Prefill+Generation) vs Batched SDPA
-python tests/bench_inference.py --save-plot assets/inference_benchmark.png
+# 3. Inference (Cold-L2 Decode L=1 & Expanded E2E Prefill+Generation) vs torch.compile Baseline
+python tests/bench_inference.py --gen-steps 32 --save-plot assets/inference_benchmark.png
+# (Optional) Run a quick 5-config E2E subset:
+python tests/bench_inference.py --e2e-quick --save-plot assets/inference_benchmark.png
 ```
 
 For an end-to-end walkthrough (including building reusable `.whl` packages and profiling all 3 kernels with `ncu --set full` into `Benchmark/*.ncu-rep`), open [Benchmark/demo_varlen_transformer.ipynb](Benchmark/demo_varlen_transformer.ipynb).

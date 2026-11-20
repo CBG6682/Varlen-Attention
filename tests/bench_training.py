@@ -1,10 +1,10 @@
-"""Training (Forward + Backward) speed and VRAM benchmark."""
+"""Training (Forward + Backward) speed and VRAM benchmark with torch.compile baseline."""
 
 import argparse
 import gc
 import os
 import sys
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 
@@ -32,9 +32,10 @@ from varlen_transformer import (
 )
 
 
-def _compile_or_warn(module: torch.nn.Module, label: str):
+def _compile_or_warn(target: Any, label: str):
+    """Compile a module or function with TorchInductor; return None on failure."""
     try:
-        return torch.compile(module, backend="inductor", dynamic=True)
+        return torch.compile(target, backend="inductor", dynamic=True)
     except Exception as exc:
         print(f"[WARN] Could not torch.compile({label}): {exc}")
         return None
@@ -53,51 +54,81 @@ def _save_training_plot(results: List[Dict[str, Any]], save_path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     skewed_rows = [r for r in results if r["dist"] == "skewed"] or results
 
-    labels = [f"B={r['B']}, L={r['max_len']}" for r in skewed_rows]
+    labels = [f"B={r['B']}\nL={r['max_len']}" for r in skewed_rows]
     x_idx = list(range(len(labels)))
-    width = 0.28
+    width = 0.35
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
 
-    t_varlen = [r["varlen_fwdbwd_ms"] for r in skewed_rows]
-    t_batched = [r["batched_fwdbwd_ms"] for r in skewed_rows]
-    has_comp = all(r.get("varlen_comp_fwdbwd_ms") is not None for r in skewed_rows)
+    has_comp = all(
+        r.get("batched_comp_fwdbwd_ms") is not None and r.get("varlen_comp_fwdbwd_ms") is not None
+        for r in skewed_rows
+    )
 
-    ax1.bar([i - width / 2 for i in x_idx], t_batched, width, label="Batched SDPA (Padded)", color="#6c757d")
-    ax1.bar([i + width / 2 for i in x_idx], t_varlen, width, label="Varlen CUDA (Fused RoPE)", color="#0d6efd")
     if has_comp:
-        t_vcomp = [r["varlen_comp_fwdbwd_ms"] for r in skewed_rows]
-        ax1.plot(x_idx, t_vcomp, marker="o", color="#198754", linewidth=2, label="Varlen + torch.compile")
-
-    for i, r in enumerate(skewed_rows):
-        sp = r["speedup_fwdbwd"]
-        ax1.annotate(
-            f"{sp:.2f}x",
-            xy=(i + width / 2, t_varlen[i]),
-            xytext=(0, 4),
-            textcoords="offset points",
-            ha="center",
-            fontsize=8,
-            fontweight="bold",
+        t_base_comp = [r["batched_comp_fwdbwd_ms"] for r in skewed_rows]
+        t_var_comp = [r["varlen_comp_fwdbwd_ms"] for r in skewed_rows]
+        ax1.bar(
+            [i - width / 2 for i in x_idx],
+            t_base_comp,
+            width,
+            label="Batched SDPA + torch.compile (Baseline)",
+            color="#e63946",
+        )
+        ax1.bar(
+            [i + width / 2 for i in x_idx],
+            t_var_comp,
+            width,
+            label="Varlen CUDA + torch.compile (Ours)",
+            color="#2a9d8f",
         )
 
-    ax1.set_title("Training Fwd+Bwd Latency (Lower is Better)")
+        for i, r in enumerate(skewed_rows):
+            sp = r.get("speedup_comp_fwdbwd", 1.0)
+            ax1.annotate(
+                f"{sp:.2f}x",
+                xy=(i + width / 2, t_var_comp[i]),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+                fontweight="bold",
+            )
+        ax1.set_title("Training Fwd+Bwd Latency vs torch.compile Baseline (Lower is Better)")
+    else:
+        t_base_eager = [r["batched_fwdbwd_ms"] for r in skewed_rows]
+        t_var_eager = [r["varlen_fwdbwd_ms"] for r in skewed_rows]
+        ax1.bar([i - width / 2 for i in x_idx], t_base_eager, width, label="Batched SDPA (Eager)", color="#6c757d")
+        ax1.bar([i + width / 2 for i in x_idx], t_var_eager, width, label="Varlen CUDA (Eager)", color="#0d6efd")
+        for i, r in enumerate(skewed_rows):
+            sp = r.get("speedup_eager_fwdbwd", 1.0)
+            ax1.annotate(
+                f"{sp:.2f}x",
+                xy=(i + width / 2, t_var_eager[i]),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+                fontweight="bold",
+            )
+        ax1.set_title("Training Fwd+Bwd Latency (Lower is Better)")
+
     ax1.set_ylabel("Latency (ms)")
     ax1.set_xticks(x_idx)
-    ax1.set_xticklabels(labels, rotation=20, ha="right")
+    ax1.set_xticklabels(labels, rotation=0, ha="center")
     ax1.grid(axis="y", linestyle="--", alpha=0.4)
-    ax1.legend()
+    ax1.legend(loc="upper left")
 
     m_varlen = [r["varlen_vram_mb"] for r in skewed_rows]
     m_batched = [r["batched_vram_mb"] for r in skewed_rows]
-    ax2.bar([i - width / 2 for i in x_idx], m_batched, width, label="Batched SDPA (Padded)", color="#fd7e14")
-    ax2.bar([i + width / 2 for i in x_idx], m_varlen, width, label="Varlen CUDA (Packed)", color="#20c997")
+    ax2.bar([i - width / 2 for i in x_idx], m_batched, width, label="Batched SDPA (Padded)", color="#f4a261")
+    ax2.bar([i + width / 2 for i in x_idx], m_varlen, width, label="Varlen CUDA (Packed)", color="#264653")
     ax2.set_title("Peak Allocated VRAM during Fwd+Bwd (Lower is Better)")
     ax2.set_ylabel("Peak Memory (MB)")
     ax2.set_xticks(x_idx)
-    ax2.set_xticklabels(labels, rotation=20, ha="right")
+    ax2.set_xticklabels(labels, rotation=0, ha="center")
     ax2.grid(axis="y", linestyle="--", alpha=0.4)
-    ax2.legend()
+    ax2.legend(loc="upper left")
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=160)
@@ -121,7 +152,13 @@ def run_training_benchmark(
     save_plot: Optional[str] = None,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
-    """Run Training (Fwd & Fwd+Bwd) speed and memory benchmark vs Baselines."""
+    """
+    Run Training (Forward & Forward+Backward) speed and memory benchmark.
+
+    Establishes `BatchedFlashGQABaselineSpeed` with `torch.compile` (TorchInductor)
+    as the primary speed baseline and benchmarks `VarlenFlashGQA` with `torch.compile`
+    directly against it, alongside eager comparisons.
+    """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required for training benchmark.")
     if not HAS_CUDA_EXT:
@@ -149,16 +186,19 @@ def run_training_benchmark(
         ).to(device=dev, dtype=torch.float16)
         mod_vref.load_state_dict(mod_varlen.state_dict())
 
+    # Compile both models with TorchInductor
     mod_varlen_comp = _compile_or_warn(mod_varlen, "VarlenFlashGQA") if include_compile else None
     mod_batched_comp = _compile_or_warn(mod_batched, "BatchedSDPA") if include_compile else None
 
     results: List[Dict[str, Any]] = []
     table_rows: List[List[str]] = []
 
-    print(
-        f"\nRunning Training Benchmark: H_q={num_heads_q}, H_kv={num_heads_kv}, D={head_dim}, "
-        f"causal={is_causal}, rope={use_rope}"
-    )
+    print("\n" + "=" * 90)
+    print(" TRAINING BENCHMARK: Varlen CUDA vs torch.compile Baseline Speed")
+    print(f" Config: H_q={num_heads_q}, H_kv={num_heads_kv}, D={head_dim}, causal={is_causal}, rope={use_rope}")
+    print(f" Primary Baseline: BatchedFlashGQABaselineSpeed + torch.compile(backend='inductor', dynamic=True)")
+    print(f" Custom Kernel:    VarlenFlashGQA + torch.compile(backend='inductor', dynamic=True)")
+    print("=" * 90)
 
     for dist in distributions:
         for B in batch_sizes:
@@ -186,53 +226,46 @@ def run_training_benchmark(
                     seqlens, seqlens, num_heads_q=num_heads_q, head_dim=head_dim, is_causal=is_causal, include_backward=True
                 )
 
-                # --- 1. Varlen CUDA Eager ---
-                def _varlen_fwd():
-                    with torch.no_grad():
-                        return mod_varlen(
-                            x_packed,
-                            cu_seqlens_q=cu_seqlens,
-                            max_seqlen_q=actual_max,
-                            max_seqlen_k=actual_max,
-                            is_causal=is_causal,
-                        )
+                # =============================================================
+                # 1. PRIMARY BASELINE: Batched SDPA + torch.compile
+                # =============================================================
+                b_comp_fwd_ms: Optional[float] = None
+                b_comp_fwdbwd_ms: Optional[float] = None
+                if mod_batched_comp is not None:
+                    def _batched_comp_fwd():
+                        with torch.no_grad():
+                            return mod_batched_comp(x_padded, attn_mask=attn_mask, is_causal=is_causal)
 
-                def _varlen_fwdbwd():
-                    mod_varlen.zero_grad(set_to_none=True)
-                    x_packed.grad = None
-                    out = mod_varlen(
-                        x_packed,
-                        cu_seqlens_q=cu_seqlens,
-                        max_seqlen_q=actual_max,
-                        max_seqlen_k=actual_max,
-                        is_causal=is_causal,
+                    def _batched_comp_fwdbwd():
+                        mod_batched.zero_grad(set_to_none=True)
+                        x_padded.grad = None
+                        out = mod_batched_comp(x_padded, attn_mask=attn_mask, is_causal=is_causal)
+                        out.backward(go_padded)
+                        return out
+
+                    b_comp_fwd_ms, _, _ = cuda_benchmark(
+                        _batched_comp_fwd, warmup=max(6, warmup // 2), rep=rep
                     )
-                    out.backward(go_packed)
-                    return out
+                    b_comp_fwdbwd_ms, _, _ = cuda_benchmark(
+                        _batched_comp_fwdbwd, warmup=max(6, warmup // 2), rep=rep
+                    )
 
-                v_fwd_ms, _, _ = cuda_benchmark(_varlen_fwd, warmup=warmup, rep=rep)
-                _, v_vram_mb = measure_peak_memory_mb(_varlen_fwdbwd)
-                v_fwdbwd_ms, _, _ = cuda_benchmark(_varlen_fwdbwd, warmup=warmup, rep=rep)
-
-                # --- 2. Batched SDPA Speed Baseline Eager ---
-                def _batched_fwd():
-                    with torch.no_grad():
-                        return mod_batched(x_padded, attn_mask=attn_mask, is_causal=is_causal)
-
-                def _batched_fwdbwd():
-                    mod_batched.zero_grad(set_to_none=True)
-                    x_padded.grad = None
-                    out = mod_batched(x_padded, attn_mask=attn_mask, is_causal=is_causal)
-                    out.backward(go_padded)
-                    return out
-
-                b_fwd_ms, _, _ = cuda_benchmark(_batched_fwd, warmup=warmup, rep=rep)
-                _, b_vram_mb = measure_peak_memory_mb(_batched_fwdbwd)
-                b_fwdbwd_ms, _, _ = cuda_benchmark(_batched_fwdbwd, warmup=warmup, rep=rep)
-
-                # --- 3. Compiled Variants ---
+                # =============================================================
+                # 2. CUSTOM KERNEL: Varlen CUDA + torch.compile
+                # =============================================================
+                v_comp_fwd_ms: Optional[float] = None
                 v_comp_fwdbwd_ms: Optional[float] = None
                 if mod_varlen_comp is not None:
+                    def _varlen_comp_fwd():
+                        with torch.no_grad():
+                            return mod_varlen_comp(
+                                x_packed,
+                                cu_seqlens_q=cu_seqlens,
+                                max_seqlen_q=actual_max,
+                                max_seqlen_k=actual_max,
+                                is_causal=is_causal,
+                            )
+
                     def _varlen_comp_fwdbwd():
                         mod_varlen.zero_grad(set_to_none=True)
                         x_packed.grad = None
@@ -246,20 +279,61 @@ def run_training_benchmark(
                         out.backward(go_packed)
                         return out
 
-                    v_comp_fwdbwd_ms, _, _ = cuda_benchmark(_varlen_comp_fwdbwd, warmup=max(5, warmup // 2), rep=rep)
+                    v_comp_fwd_ms, _, _ = cuda_benchmark(
+                        _varlen_comp_fwd, warmup=max(6, warmup // 2), rep=rep
+                    )
+                    v_comp_fwdbwd_ms, _, _ = cuda_benchmark(
+                        _varlen_comp_fwdbwd, warmup=max(6, warmup // 2), rep=rep
+                    )
 
-                b_comp_fwdbwd_ms: Optional[float] = None
-                if mod_batched_comp is not None:
-                    def _batched_comp_fwdbwd():
-                        mod_batched.zero_grad(set_to_none=True)
-                        x_padded.grad = None
-                        out = mod_batched_comp(x_padded, attn_mask=attn_mask, is_causal=is_causal)
-                        out.backward(go_padded)
-                        return out
+                # =============================================================
+                # 3. EAGER BASELINES: Batched SDPA Eager & Varlen CUDA Eager
+                # =============================================================
+                def _batched_eager_fwd():
+                    with torch.no_grad():
+                        return mod_batched(x_padded, attn_mask=attn_mask, is_causal=is_causal)
 
-                    b_comp_fwdbwd_ms, _, _ = cuda_benchmark(_batched_comp_fwdbwd, warmup=max(5, warmup // 2), rep=rep)
+                def _batched_eager_fwdbwd():
+                    mod_batched.zero_grad(set_to_none=True)
+                    x_padded.grad = None
+                    out = mod_batched(x_padded, attn_mask=attn_mask, is_causal=is_causal)
+                    out.backward(go_padded)
+                    return out
 
-                # --- 4. Optional Python Varlen Reference ---
+                b_eager_fwd_ms, _, _ = cuda_benchmark(_batched_eager_fwd, warmup=warmup, rep=rep)
+                _, b_vram_mb = measure_peak_memory_mb(_batched_eager_fwdbwd)
+                b_eager_fwdbwd_ms, _, _ = cuda_benchmark(_batched_eager_fwdbwd, warmup=warmup, rep=rep)
+
+                def _varlen_eager_fwd():
+                    with torch.no_grad():
+                        return mod_varlen(
+                            x_packed,
+                            cu_seqlens_q=cu_seqlens,
+                            max_seqlen_q=actual_max,
+                            max_seqlen_k=actual_max,
+                            is_causal=is_causal,
+                        )
+
+                def _varlen_eager_fwdbwd():
+                    mod_varlen.zero_grad(set_to_none=True)
+                    x_packed.grad = None
+                    out = mod_varlen(
+                        x_packed,
+                        cu_seqlens_q=cu_seqlens,
+                        max_seqlen_q=actual_max,
+                        max_seqlen_k=actual_max,
+                        is_causal=is_causal,
+                    )
+                    out.backward(go_packed)
+                    return out
+
+                v_eager_fwd_ms, _, _ = cuda_benchmark(_varlen_eager_fwd, warmup=warmup, rep=rep)
+                _, v_vram_mb = measure_peak_memory_mb(_varlen_eager_fwdbwd)
+                v_eager_fwdbwd_ms, _, _ = cuda_benchmark(_varlen_eager_fwdbwd, warmup=warmup, rep=rep)
+
+                # =============================================================
+                # 4. Optional Python Varlen Reference
+                # =============================================================
                 vref_fwdbwd_ms: Optional[float] = None
                 if mod_vref is not None and actual_max <= 1024:
                     def _vref_fwdbwd():
@@ -271,10 +345,34 @@ def run_training_benchmark(
 
                     vref_fwdbwd_ms, _, _ = cuda_benchmark(_vref_fwdbwd, warmup=3, rep=15)
 
-                speedup_fwd = b_fwd_ms / max(v_fwd_ms, 1e-6)
-                speedup_fwdbwd = b_fwdbwd_ms / max(v_fwdbwd_ms, 1e-6)
-                tflops_fwd = compute_tflops(active_flops_fwd, v_fwd_ms)
-                tflops_fwdbwd = compute_tflops(active_flops_fwdbwd, v_fwdbwd_ms)
+                # Primary Speedup: Compiled Varlen vs Compiled Baseline
+                if b_comp_fwdbwd_ms is not None and v_comp_fwdbwd_ms is not None:
+                    speedup_comp_fwdbwd = b_comp_fwdbwd_ms / max(v_comp_fwdbwd_ms, 1e-6)
+                    speedup_comp_fwd = (
+                        b_comp_fwd_ms / max(v_comp_fwd_ms, 1e-6)
+                        if b_comp_fwd_ms is not None and v_comp_fwd_ms is not None
+                        else 1.0
+                    )
+                else:
+                    speedup_comp_fwdbwd = None
+                    speedup_comp_fwd = None
+
+                # Secondary Speedup: Eager Varlen vs Eager Batched
+                speedup_eager_fwdbwd = b_eager_fwdbwd_ms / max(v_eager_fwdbwd_ms, 1e-6)
+                speedup_eager_fwd = b_eager_fwd_ms / max(v_eager_fwd_ms, 1e-6)
+
+                # Inductor gain on Custom Kernel
+                inductor_gain = (
+                    v_eager_fwdbwd_ms / max(v_comp_fwdbwd_ms, 1e-6)
+                    if v_comp_fwdbwd_ms is not None
+                    else 1.0
+                )
+
+                # TFLOP/s based on compiled or eager execution
+                best_v_fwd = v_comp_fwd_ms if v_comp_fwd_ms is not None else v_eager_fwd_ms
+                best_v_fwdbwd = v_comp_fwdbwd_ms if v_comp_fwdbwd_ms is not None else v_eager_fwdbwd_ms
+                tflops_fwd = compute_tflops(active_flops_fwd, best_v_fwd)
+                tflops_fwdbwd = compute_tflops(active_flops_fwdbwd, best_v_fwdbwd)
 
                 row_dict = {
                     "dist": dist,
@@ -282,14 +380,19 @@ def run_training_benchmark(
                     "max_len": actual_max,
                     "total_tokens": total_tokens,
                     "pad_waste_pct": pad_waste_pct,
-                    "varlen_fwd_ms": v_fwd_ms,
-                    "batched_fwd_ms": b_fwd_ms,
-                    "speedup_fwd": speedup_fwd,
-                    "varlen_fwdbwd_ms": v_fwdbwd_ms,
-                    "batched_fwdbwd_ms": b_fwdbwd_ms,
-                    "speedup_fwdbwd": speedup_fwdbwd,
-                    "varlen_comp_fwdbwd_ms": v_comp_fwdbwd_ms,
+                    "batched_comp_fwd_ms": b_comp_fwd_ms,
+                    "varlen_comp_fwd_ms": v_comp_fwd_ms,
+                    "speedup_comp_fwd": speedup_comp_fwd,
                     "batched_comp_fwdbwd_ms": b_comp_fwdbwd_ms,
+                    "varlen_comp_fwdbwd_ms": v_comp_fwdbwd_ms,
+                    "speedup_comp_fwdbwd": speedup_comp_fwdbwd,
+                    "batched_fwd_ms": b_eager_fwd_ms,
+                    "varlen_fwd_ms": v_eager_fwd_ms,
+                    "speedup_eager_fwd": speedup_eager_fwd,
+                    "batched_fwdbwd_ms": b_eager_fwdbwd_ms,
+                    "varlen_fwdbwd_ms": v_eager_fwdbwd_ms,
+                    "speedup_eager_fwdbwd": speedup_eager_fwdbwd,
+                    "inductor_gain": inductor_gain,
                     "vref_fwdbwd_ms": vref_fwdbwd_ms,
                     "tflops_fwd": tflops_fwd,
                     "tflops_fwdbwd": tflops_fwdbwd,
@@ -298,23 +401,27 @@ def run_training_benchmark(
                 }
                 results.append(row_dict)
 
-                row_str = [
-                    dist,
-                    str(B),
-                    str(actual_max),
-                    f"{pad_waste_pct:.1f}%",
-                    f"{v_fwd_ms:.3f} ({speedup_fwd:.2f}x)",
-                    f"{b_fwd_ms:.3f}",
-                    f"{v_fwdbwd_ms:.3f} ({speedup_fwdbwd:.2f}x)",
-                    f"{b_fwdbwd_ms:.3f}",
-                    f"{v_comp_fwdbwd_ms:.3f}" if v_comp_fwdbwd_ms is not None else "N/A",
-                    f"{b_comp_fwdbwd_ms:.3f}" if b_comp_fwdbwd_ms is not None else "N/A",
-                    f"{tflops_fwdbwd:.2f}",
-                    f"{v_vram_mb:.1f} / {b_vram_mb:.1f}",
-                ]
-                if include_varlen_ref:
-                    row_str.append(f"{vref_fwdbwd_ms:.2f}" if vref_fwdbwd_ms is not None else "skipped")
-                table_rows.append(row_str)
+                comp_sp_str = f"{speedup_comp_fwdbwd:.2f}x" if speedup_comp_fwdbwd is not None else "N/A"
+                b_comp_str = f"{b_comp_fwdbwd_ms:.3f}" if b_comp_fwdbwd_ms is not None else "N/A"
+                v_comp_str = f"{v_comp_fwdbwd_ms:.3f}" if v_comp_fwdbwd_ms is not None else "N/A"
+
+                table_rows.append(
+                    [
+                        dist,
+                        str(B),
+                        str(actual_max),
+                        f"{pad_waste_pct:.1f}%",
+                        b_comp_str,
+                        v_comp_str,
+                        comp_sp_str,
+                        f"{b_eager_fwdbwd_ms:.3f}",
+                        f"{v_eager_fwdbwd_ms:.3f}",
+                        f"{speedup_eager_fwdbwd:.2f}x",
+                        f"{inductor_gain:.2f}x",
+                        f"{tflops_fwdbwd:.2f}",
+                        f"{v_vram_mb:.1f} / {b_vram_mb:.1f}",
+                    ]
+                )
 
                 del x_padded, go_padded, x_packed, go_packed, attn_mask
                 gc.collect()
@@ -325,17 +432,16 @@ def run_training_benchmark(
         "B",
         "MaxLen",
         "Pad%",
-        "Varlen Fwd(ms)",
-        "Batched Fwd(ms)",
-        "Varlen Fwd+Bwd",
-        "Batched Fwd+Bwd",
-        "Varlen+Compile",
-        "Batched+Compile",
-        "Eff TFLOP/s",
+        "Batched+Comp(ms) [Baseline]",
+        "Varlen+Comp(ms) [Ours]",
+        "Comp Speedup",
+        "Batched Eager",
+        "Varlen Eager",
+        "Eager Speedup",
+        "Inductor Gain",
+        "TFLOP/s",
         "VRAM MB (V/B)",
     ]
-    if include_varlen_ref:
-        headers.append("PyVarlenRef(ms)")
 
     print("\n" + format_markdown_table(headers, table_rows))
 
@@ -346,7 +452,7 @@ def run_training_benchmark(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Training benchmark for VarlenFlashGQA vs Baselines.")
+    parser = argparse.ArgumentParser(description="Training benchmark for VarlenFlashGQA vs torch.compile Baseline.")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[4, 8, 16])
     parser.add_argument("--max-lens", type=int, nargs="+", default=[512, 1024, 2048])
     parser.add_argument("--distributions", nargs="+", default=["skewed", "uniform"])
