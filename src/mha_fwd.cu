@@ -1,17 +1,24 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
-#include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <tuple>
+#include <type_traits>
+
+#include <cute/tensor.hpp>
+#include <cute/algorithm/copy.hpp>
+#include <cute/algorithm/gemm.hpp>
+#include <cute/arch/copy_sm75.hpp>
+#include <cute/arch/mma_sm75.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 #include "mha_common.cuh"
 #include "mha_ops.cuh"
