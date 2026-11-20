@@ -68,11 +68,10 @@ def _save_inference_plot(
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     skewed_rows = [r for r in decode_results if r.get("dist") == "skewed"] or decode_results
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5.5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5.5))
 
     labels = [f"B={r['B']}\nL={r['max_len']}" for r in skewed_rows]
     x_idx = list(range(len(labels)))
-    width = 0.35
 
     has_comp_dec = all(
         r.get("batched_comp_ms") is not None and r.get("varlen_comp_ms") is not None
@@ -80,51 +79,73 @@ def _save_inference_plot(
     )
 
     if has_comp_dec:
+        w = 0.21
         t_base = [r["batched_comp_ms"] for r in skewed_rows]
-        t_varlen = [r["varlen_comp_ms"] for r in skewed_rows]
+        t_dir = [r.get("varlen_direct_comp_ms") or r["varlen_direct_eager_ms"] for r in skewed_rows]
+        t_spk = [r.get("varlen_splitk_comp_ms") or r["varlen_splitk_eager_ms"] for r in skewed_rows]
+        t_auto = [r["varlen_comp_ms"] for r in skewed_rows]
         ax1.bar(
-            [i - width / 2 for i in x_idx],
+            [i - 1.5 * w for i in x_idx],
             t_base,
-            width,
-            label="Batched SDPA Decode + torch.compile (Baseline)",
+            w,
+            label="Batched SDPA + Compile (Base)",
             color="#e63946",
         )
         ax1.bar(
-            [i + width / 2 for i in x_idx],
-            t_varlen,
-            width,
-            label="Varlen Split-K Decode + torch.compile (Ours)",
+            [i - 0.5 * w for i in x_idx],
+            t_dir,
+            w,
+            label="Varlen Direct 1-Block",
+            color="#457b9d",
+        )
+        ax1.bar(
+            [i + 0.5 * w for i in x_idx],
+            t_spk,
+            w,
+            label="Varlen Split-K",
+            color="#e9c46a",
+        )
+        ax1.bar(
+            [i + 1.5 * w for i in x_idx],
+            t_auto,
+            w,
+            label="Varlen Auto-Dispatch (Ours)",
             color="#2a9d8f",
         )
         for i, r in enumerate(skewed_rows):
             sp = r.get("speedup_comp", 1.0)
             ax1.annotate(
-                f"{sp:.2f}x\n({r['bw_gbps']:.0f} GB/s)",
-                xy=(i + width / 2, t_varlen[i]),
-                xytext=(0, 4),
+                f"{sp:.2f}x",
+                xy=(i + 1.5 * w, t_auto[i]),
+                xytext=(0, 3),
                 textcoords="offset points",
                 ha="center",
-                fontsize=7,
+                fontsize=6.5,
                 fontweight="bold",
             )
-        ax1.set_title("Decode L_q=1 Latency vs torch.compile Baseline (Lower is Better)")
+        ax1.set_title("Decode L_q=1 Latency: Direct vs Split-K vs Auto vs Compiled Baseline")
     else:
+        w = 0.25
         t_base = [r["batched_dec_ms"] for r in skewed_rows]
-        t_varlen = [r["varlen_dec_ms"] for r in skewed_rows]
-        ax1.bar([i - width / 2 for i in x_idx], t_base, width, label="Batched SDPA Decode (Eager)", color="#6c757d")
-        ax1.bar([i + width / 2 for i in x_idx], t_varlen, width, label="Varlen Split-K Decode (Eager)", color="#0d6efd")
+        t_dir = [r["varlen_direct_eager_ms"] for r in skewed_rows]
+        t_spk = [r["varlen_splitk_eager_ms"] for r in skewed_rows]
+        t_auto = [r["varlen_dec_ms"] for r in skewed_rows]
+        ax1.bar([i - 1.5 * w for i in x_idx], t_base, w, label="Batched SDPA (Eager)", color="#6c757d")
+        ax1.bar([i - 0.5 * w for i in x_idx], t_dir, w, label="Varlen Direct 1-Block", color="#457b9d")
+        ax1.bar([i + 0.5 * w for i in x_idx], t_spk, w, label="Varlen Split-K", color="#e9c46a")
+        ax1.bar([i + 1.5 * w for i in x_idx], t_auto, w, label="Varlen Auto (Ours)", color="#0d6efd")
         for i, r in enumerate(skewed_rows):
             sp = r.get("speedup_eager", 1.0)
             ax1.annotate(
                 f"{sp:.2f}x",
-                xy=(i + width / 2, t_varlen[i]),
-                xytext=(0, 4),
+                xy=(i + 1.5 * w, t_auto[i]),
+                xytext=(0, 3),
                 textcoords="offset points",
                 ha="center",
-                fontsize=7,
+                fontsize=6.5,
                 fontweight="bold",
             )
-        ax1.set_title("Decode L_q=1 Latency (Lower is Better)")
+        ax1.set_title("Decode L_q=1 Latency: Direct vs Split-K vs Auto")
 
     ax1.set_ylabel("Latency (ms)")
     ax1.set_xticks(x_idx)
@@ -134,6 +155,7 @@ def _save_inference_plot(
 
     # Plot E2E TPOT
     if e2e_results:
+        width = 0.35
         # Select representative cases (max 10 to fit cleanly)
         selected_e2e = e2e_results[:10] if len(e2e_results) > 10 else e2e_results
         e2e_labels = [f"B={r['B']}\nL={r['max_len']}" for r in selected_e2e]
@@ -194,7 +216,7 @@ def _save_inference_plot(
 
 def run_inference_benchmark(
     decode_batch_sizes: Sequence[int] = (1, 8, 32),
-    decode_max_lens: Sequence[int] = (256, 1024, 2048, 4096),
+    decode_max_lens: Sequence[int] = (128, 256, 1024, 2048, 4096),
     decode_distributions: Sequence[str] = ("skewed", "uniform"),
     e2e_configs: Optional[Sequence[Tuple[int, int]]] = None,
     num_heads_q: int = 16,
@@ -248,14 +270,30 @@ def run_inference_benchmark(
     print(f" Custom Kernel:  Varlen Split-K Decode + torch.compile(backend='inductor', dynamic=True)")
     print("=" * 90)
 
-    # Compile Part A ops
-    compiled_varlen_dec = None
+    # Compile Part A ops (Auto, Direct 1-Block, Split-K, and Batched SDPA Baseline)
+    compiled_varlen_auto = None
+    compiled_varlen_direct = None
+    compiled_varlen_splitk = None
     compiled_batched_dec = None
     if include_compile:
-        def _c_varlen_dec(q_in, k_in, v_in, cu_in, max_k, c_in, s_in):
+        def _c_varlen_auto(q_in, k_in, v_in, cu_in, max_k, c_in, s_in):
             return varlen_flash_decode(q_in, k_in, v_in, cu_in, max_seqlen_k=max_k, cos=c_in, sin=s_in)
 
-        compiled_varlen_dec = _compile_or_warn(_c_varlen_dec, "varlen_flash_decode")
+        compiled_varlen_auto = _compile_or_warn(_c_varlen_auto, "varlen_flash_decode_auto")
+
+        def _c_varlen_direct(q_in, k_in, v_in, cu_in, max_k, c_in, s_in):
+            return varlen_flash_decode(
+                q_in, k_in, v_in, cu_in, max_seqlen_k=max_k, cos=c_in, sin=s_in, use_splitk=False
+            )
+
+        compiled_varlen_direct = _compile_or_warn(_c_varlen_direct, "varlen_flash_decode_direct")
+
+        def _c_varlen_splitk(q_in, k_in, v_in, cu_in, max_k, c_in, s_in):
+            return varlen_flash_decode(
+                q_in, k_in, v_in, cu_in, max_seqlen_k=max_k, cos=c_in, sin=s_in, use_splitk=True
+            )
+
+        compiled_varlen_splitk = _compile_or_warn(_c_varlen_splitk, "varlen_flash_decode_splitk")
 
         def _c_batched_dec(q_b, k_b, v_b, pad_m, sc_val, rep_val):
             k_exp = _repeat_kv_batched(k_b, rep_val)
@@ -270,25 +308,21 @@ def run_inference_benchmark(
     for dist in decode_distributions:
         for B in decode_batch_sizes:
             for max_len in decode_max_lens:
-                min_len = max(32, max_len // 16)
+                min_len = max(16, max_len // 16)
                 seqlens, cu_seqlens, actual_max = generate_varlen_seqlens(
                     B, min_len, max_len, distribution=dist, device=dev
                 )
                 total_lk = int(cu_seqlens[-1].item())
 
-                q_dec = torch.randn((num_heads_q, B, head_dim), device=dev, dtype=torch.float16)
-                k_packed = torch.randn((num_heads_kv, total_lk, head_dim), device=dev, dtype=torch.float16)
-                v_packed = torch.randn((num_heads_kv, total_lk, head_dim), device=dev, dtype=torch.float16)
-
-                q_batched = q_dec.transpose(0, 1).unsqueeze(2).contiguous()  # (B, H_q, 1, D)
+                # =============================================================
+                # PHASE 1: BATCHED SDPA DECODE BASELINE (Isolated VRAM)
+                # =============================================================
+                q_batched = torch.randn((B, num_heads_q, 1, head_dim), device=dev, dtype=torch.float16)
                 k_batched = torch.randn((B, num_heads_kv, actual_max, head_dim), device=dev, dtype=torch.float16)
                 v_batched = torch.randn((B, num_heads_kv, actual_max, head_dim), device=dev, dtype=torch.float16)
                 pad_mask = build_padding_mask(cu_seqlens, actual_max)
-
-                # Pre-apply RoPE to batched query for fairness
                 q_batched_roped = rope(q_batched, offset=actual_max - 1) if rope is not None else q_batched
 
-                # 1. Batched SDPA Compiled (Primary Baseline Speed)
                 b_comp_ms: Optional[float] = None
                 if compiled_batched_dec is not None:
                     def _batched_dec_comp_fn():
@@ -300,21 +334,9 @@ def run_inference_benchmark(
                     b_comp_ms, _, _ = cuda_benchmark(
                         _batched_dec_comp_fn, warmup=max(5, warmup // 2), rep=rep, clear_l2=clear_l2
                     )
+                    torch.cuda.empty_cache()
+                    _, b_vram_mb = measure_peak_memory_mb(_batched_dec_comp_fn)
 
-                # 2. Varlen Decode Compiled (Custom Kernel)
-                v_comp_ms: Optional[float] = None
-                if compiled_varlen_dec is not None:
-                    def _varlen_dec_comp_fn():
-                        with torch.no_grad():
-                            return compiled_varlen_dec(
-                                q_dec, k_packed, v_packed, cu_seqlens, actual_max, cos, sin
-                            )
-
-                    v_comp_ms, _, _ = cuda_benchmark(
-                        _varlen_dec_comp_fn, warmup=max(5, warmup // 2), rep=rep, clear_l2=clear_l2
-                    )
-
-                # 3. Batched SDPA Eager
                 def _batched_dec_eager_fn():
                     with torch.no_grad():
                         k_exp = _repeat_kv_batched(k_batched, rep_gqa)
@@ -326,27 +348,123 @@ def run_inference_benchmark(
                 b_eager_ms, _, _ = cuda_benchmark(
                     _batched_dec_eager_fn, warmup=warmup, rep=rep, clear_l2=clear_l2
                 )
+                if compiled_batched_dec is None:
+                    torch.cuda.empty_cache()
+                    _, b_vram_mb = measure_peak_memory_mb(_batched_dec_eager_fn)
 
-                # 4. Varlen Decode Eager
-                def _varlen_dec_eager_fn():
+                del q_batched, q_batched_roped, k_batched, v_batched, pad_mask
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                # =============================================================
+                # PHASE 2: VARLEN DECODE (Direct 1-Blk, Split-K, Auto + Isolated VRAM)
+                # =============================================================
+                q_dec = torch.randn((num_heads_q, B, head_dim), device=dev, dtype=torch.float16)
+                k_packed = torch.randn((num_heads_kv, total_lk, head_dim), device=dev, dtype=torch.float16)
+                v_packed = torch.randn((num_heads_kv, total_lk, head_dim), device=dev, dtype=torch.float16)
+
+                # Compiled modes (Direct 1-Block, Split-K, Auto Dispatch)
+                v_direct_comp_ms: Optional[float] = None
+                v_splitk_comp_ms: Optional[float] = None
+                v_auto_comp_ms: Optional[float] = None
+                v_direct_vram_mb: float = 0.0
+                v_splitk_vram_mb: float = 0.0
+
+                if compiled_varlen_direct is not None:
+                    def _varlen_direct_comp_fn():
+                        with torch.no_grad():
+                            return compiled_varlen_direct(
+                                q_dec, k_packed, v_packed, cu_seqlens, actual_max, cos, sin
+                            )
+
+                    v_direct_comp_ms, _, _ = cuda_benchmark(
+                        _varlen_direct_comp_fn, warmup=max(5, warmup // 2), rep=rep, clear_l2=clear_l2
+                    )
+                    torch.cuda.empty_cache()
+                    _, v_direct_vram_mb = measure_peak_memory_mb(_varlen_direct_comp_fn)
+
+                if compiled_varlen_splitk is not None:
+                    def _varlen_splitk_comp_fn():
+                        with torch.no_grad():
+                            return compiled_varlen_splitk(
+                                q_dec, k_packed, v_packed, cu_seqlens, actual_max, cos, sin
+                            )
+
+                    v_splitk_comp_ms, _, _ = cuda_benchmark(
+                        _varlen_splitk_comp_fn, warmup=max(5, warmup // 2), rep=rep, clear_l2=clear_l2
+                    )
+                    torch.cuda.empty_cache()
+                    _, v_splitk_vram_mb = measure_peak_memory_mb(_varlen_splitk_comp_fn)
+
+                if compiled_varlen_auto is not None:
+                    def _varlen_auto_comp_fn():
+                        with torch.no_grad():
+                            return compiled_varlen_auto(
+                                q_dec, k_packed, v_packed, cu_seqlens, actual_max, cos, sin
+                            )
+
+                    v_auto_comp_ms, _, _ = cuda_benchmark(
+                        _varlen_auto_comp_fn, warmup=max(5, warmup // 2), rep=rep, clear_l2=clear_l2
+                    )
+
+                # Eager modes (Direct 1-Block, Split-K, Auto Dispatch)
+                def _varlen_direct_eager_fn():
+                    with torch.no_grad():
+                        return varlen_flash_decode(
+                            q_dec,
+                            k_packed,
+                            v_packed,
+                            cu_seqlens,
+                            max_seqlen_k=actual_max,
+                            cos=cos,
+                            sin=sin,
+                            use_splitk=False,
+                        )
+
+                def _varlen_splitk_eager_fn():
+                    with torch.no_grad():
+                        return varlen_flash_decode(
+                            q_dec,
+                            k_packed,
+                            v_packed,
+                            cu_seqlens,
+                            max_seqlen_k=actual_max,
+                            cos=cos,
+                            sin=sin,
+                            use_splitk=True,
+                        )
+
+                def _varlen_auto_eager_fn():
                     with torch.no_grad():
                         return varlen_flash_decode(
                             q_dec, k_packed, v_packed, cu_seqlens, max_seqlen_k=actual_max, cos=cos, sin=sin
                         )
 
-                v_eager_ms, _, _ = cuda_benchmark(
-                    _varlen_dec_eager_fn, warmup=warmup, rep=rep, clear_l2=clear_l2
+                v_direct_eager_ms, _, _ = cuda_benchmark(
+                    _varlen_direct_eager_fn, warmup=warmup, rep=rep, clear_l2=clear_l2
                 )
+                v_splitk_eager_ms, _, _ = cuda_benchmark(
+                    _varlen_splitk_eager_fn, warmup=warmup, rep=rep, clear_l2=clear_l2
+                )
+                v_eager_ms, _, _ = cuda_benchmark(
+                    _varlen_auto_eager_fn, warmup=warmup, rep=rep, clear_l2=clear_l2
+                )
+                if compiled_varlen_direct is None:
+                    torch.cuda.empty_cache()
+                    _, v_direct_vram_mb = measure_peak_memory_mb(_varlen_direct_eager_fn)
+                if compiled_varlen_splitk is None:
+                    torch.cuda.empty_cache()
+                    _, v_splitk_vram_mb = measure_peak_memory_mb(_varlen_splitk_eager_fn)
 
-                # Speedups
+                # Speedups & metrics
                 speedup_comp = (
-                    b_comp_ms / max(v_comp_ms, 1e-6)
-                    if b_comp_ms is not None and v_comp_ms is not None
+                    b_comp_ms / max(v_auto_comp_ms, 1e-6)
+                    if b_comp_ms is not None and v_auto_comp_ms is not None
                     else None
                 )
                 speedup_eager = b_eager_ms / max(v_eager_ms, 1e-6)
 
-                best_v_ms = v_comp_ms if v_comp_ms is not None else v_eager_ms
+                best_v_ms = v_auto_comp_ms if v_auto_comp_ms is not None else v_eager_ms
                 bw_gbps = compute_decode_bandwidth_gbps(
                     total_lk, num_heads_kv, num_heads_q, B, head_dim, best_v_ms
                 )
@@ -359,19 +477,28 @@ def run_inference_benchmark(
                         "max_len": actual_max,
                         "total_lk": total_lk,
                         "batched_comp_ms": b_comp_ms,
-                        "varlen_comp_ms": v_comp_ms,
+                        "varlen_direct_comp_ms": v_direct_comp_ms,
+                        "varlen_splitk_comp_ms": v_splitk_comp_ms,
+                        "varlen_comp_ms": v_auto_comp_ms,
                         "speedup_comp": speedup_comp,
                         "batched_dec_ms": b_eager_ms,
+                        "varlen_direct_eager_ms": v_direct_eager_ms,
+                        "varlen_splitk_eager_ms": v_splitk_eager_ms,
                         "varlen_dec_ms": v_eager_ms,
                         "speedup_eager": speedup_eager,
                         "bw_gbps": bw_gbps,
                         "tok_per_s": tok_per_s,
+                        "varlen_direct_vram_mb": v_direct_vram_mb,
+                        "varlen_splitk_vram_mb": v_splitk_vram_mb,
+                        "batched_vram_mb": b_vram_mb,
                     }
                 )
 
-                b_comp_str = f"{b_comp_ms:.3f}" if b_comp_ms is not None else "N/A"
-                v_comp_str = f"{v_comp_ms:.3f}" if v_comp_ms is not None else "N/A"
-                sp_comp_str = f"{speedup_comp:.2f}x" if speedup_comp is not None else "N/A"
+                b_comp_str = f"{b_comp_ms:.3f}" if b_comp_ms is not None else f"{b_eager_ms:.3f}"
+                v_dir_str = f"{v_direct_comp_ms:.3f}" if v_direct_comp_ms is not None else f"{v_direct_eager_ms:.3f}"
+                v_spk_str = f"{v_splitk_comp_ms:.3f}" if v_splitk_comp_ms is not None else f"{v_splitk_eager_ms:.3f}"
+                v_auto_str = f"{v_auto_comp_ms:.3f}" if v_auto_comp_ms is not None else f"{v_eager_ms:.3f}"
+                sp_comp_str = f"{speedup_comp:.2f}x" if speedup_comp is not None else f"{speedup_eager:.2f}x"
 
                 decode_rows.append(
                     [
@@ -380,17 +507,17 @@ def run_inference_benchmark(
                         str(actual_max),
                         str(total_lk),
                         b_comp_str,
-                        v_comp_str,
+                        v_dir_str,
+                        v_spk_str,
+                        v_auto_str,
                         sp_comp_str,
-                        f"{b_eager_ms:.3f}",
-                        f"{v_eager_ms:.3f}",
-                        f"{speedup_eager:.2f}x",
                         f"{bw_gbps:.1f}",
                         f"{tok_per_s:,.0f}",
+                        f"{v_direct_vram_mb:.1f} / {v_splitk_vram_mb:.1f} / {b_vram_mb:.1f}",
                     ]
                 )
 
-                del q_dec, k_packed, v_packed, q_batched, q_batched_roped, k_batched, v_batched, pad_mask
+                del q_dec, k_packed, v_packed
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -402,14 +529,14 @@ def run_inference_benchmark(
                 "B",
                 "MaxK",
                 "TotalLk",
-                "Batched+Comp(ms) [Baseline]",
-                "Varlen+Comp(ms) [Ours]",
-                "Comp Speedup",
-                "Batched Eager",
-                "Varlen Eager",
-                "Eager Speedup",
+                "Batched+Comp(ms) [Base]",
+                "Direct 1-Blk(ms)",
+                "Split-K(ms)",
+                "Auto+Comp(ms) [Ours]",
+                "Comp Spd",
                 "BW (GB/s)",
                 "Tok/s",
+                "VRAM MB (Dir/SpK/Base)",
             ],
             decode_rows,
         )
@@ -917,7 +1044,7 @@ def run_inference_benchmark(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inference benchmark for VarlenFlashGQA vs torch.compile Baseline.")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 8, 32])
-    parser.add_argument("--max-lens", type=int, nargs="+", default=[256, 1024, 2048, 4096])
+    parser.add_argument("--max-lens", type=int, nargs="+", default=[128, 256, 1024, 2048, 4096])
     parser.add_argument("--distributions", nargs="+", default=["skewed", "uniform"])
     parser.add_argument("--e2e-batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument("--e2e-max-lens", type=int, nargs="+", default=None)

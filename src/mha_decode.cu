@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include <cute/tensor.hpp>
 #include <cute/algorithm/copy.hpp>
@@ -31,23 +32,27 @@ static constexpr float DECODE_VALID_THRESH = -1e29f;
 
 /*
  * Tóm tắt luồng thực thi kernel_fused_mha_varlen_decode_splitk (Không dùng MMA):
- *   Grid = (num_splits, H_q, B), Block = (128, 1, 1) (4 warps).
+ *   Grid = (num_splits, H_q, B) (với USE_SPLITK=false thì num_splits = 1), Block = (128, 1, 1) (4 warps).
  *   Mỗi CTA xử lý 1 phân đoạn token K/V thuộc [split_start, split_end) của cặp (head_q_idx, seq_idx):
  *   - Giai đoạn 1 (Khởi tạo): Đọc biên chuỗi k_start/k_end, chia phạm vi split; nếu split rỗng thì ghi
- *     o_part = 0, lse_part = DECODE_NEG_INF và return sớm. Nạp broadcast q, áp RoPE tại (offset + lk_i - 1)
- *     và nhân sm_scale ở FP32; khai báo một lần SMEM (4,224 B), Copy Atoms và 2-stage Prefetch buffers.
+ *     o_part = 0, lse_part = DECODE_NEG_INF (hoặc O_direct = 0 nếu !USE_SPLITK) và return sớm.
+ *     Nạp broadcast q, áp RoPE tại (offset + lk_i - 1) và nhân sm_scale ở FP32; khai báo SMEM (4,224 B)
+ *     và Copy Atoms 2-stage Prefetch buffers.
  *   - Giai đoạn 2 (Main Loop - Rule 24A 2-stage Register Prefetch): Duyệt các tile 16 token K/V, nạp xen kẽ
  *     vào s0/s1 bằng uint4 (áp RoPE cho raw K_cache tại vị trí offset + t), tính dot-product FP32 qua
  *     octet_reduce_sum_f32 và cập nhật Online Softmax + tích lũy o_acc (FP32) cục bộ theo từng hàng token.
  *   - Giai đoạn 3 (Epilogue): Ghi rO_acc và (m_local, l_local) xuống SMEM swizzled (Swizzle<3, 2, 4>),
- *     __syncthreads(), rồi gộp 16 hàng về 1 vector theo bố cục 8x16 LayoutLeft bằng octet reduction (FP32)
- *     và ghi ra gO_part (uint4), gLSE_part (lane leader) bằng cute::copy_if.
+ *     __syncthreads(), gộp 16 hàng về 1 vector theo bố cục 8x16 LayoutLeft bằng octet reduction (FP32):
+ *     + Nếu USE_SPLITK=true: ghi gO_part (FP32 uint4) và gLSE_part (lane leader) bằng cute::copy_if.
+ *     + Nếu USE_SPLITK=false: ghép cặp octet trên thanh ghi qua __shfl_xor_sync(..., 8), ép kiểu
+ *       FP32 -> FP16 và xuất trực tiếp ra gO_direct (FP16 uint4) không qua bộ đệm trung gian hay reduce.
  */
 template <
     int HEAD_DIM = 64,
     int NUM_THREADS = 128,
     int TILE_K_TOKENS = 16,
-    bool HAS_ROPE = true
+    bool HAS_ROPE = true,
+    bool USE_SPLITK = true
 >
 __global__ void __launch_bounds__(NUM_THREADS)
 kernel_fused_mha_varlen_decode_splitk(
@@ -58,8 +63,9 @@ kernel_fused_mha_varlen_decode_splitk(
     const cutlass::half_t* __restrict__ cos_ptr,      // (L_max, 64) [FP16] - Bảng cos RoPE (hoặc nullptr)
     const cutlass::half_t* __restrict__ sin_ptr,      // (L_max, 64) [FP16] - Bảng sin RoPE (hoặc nullptr)
     const int32_t* __restrict__ offsets_ptr,          // (B,) [Int32] - Offset RoPE từng chuỗi (hoặc nullptr)
-    float* __restrict__ O_part_ptr,                   // (H_q, B, num_splits, 64) [FP32] - Output cục bộ mỗi split
-    float* __restrict__ LSE_part_ptr,                 // (H_q, B, num_splits) [FP32] - LSE cục bộ mỗi split
+    float* __restrict__ O_part_ptr,                   // (H_q, B, num_splits, 64) [FP32] - Output cục bộ split (nullptr nếu !USE_SPLITK)
+    float* __restrict__ LSE_part_ptr,                 // (H_q, B, num_splits) [FP32] - LSE cục bộ split (nullptr nếu !USE_SPLITK)
+    cutlass::half_t* __restrict__ O_direct_ptr,       // (H_q, B, 64) [FP16] - Output trực tiếp (dùng khi !USE_SPLITK)
     int H_q,                                          // scalar [int] - Số head Query
     int H_kv,                                         // scalar [int] - Số head Key/Value
     int B,                                            // scalar [int] - Batch size
@@ -69,7 +75,7 @@ kernel_fused_mha_varlen_decode_splitk(
 ) {
     // ==================== GIAI ĐOẠN 1: KHỞI TẠO & CẤU HÌNH TENSOR ====================
     const int tid = static_cast<int>(threadIdx.x);
-    const int split_idx = static_cast<int>(blockIdx.x);
+    const int split_idx = USE_SPLITK ? static_cast<int>(blockIdx.x) : 0;
     const int head_q_idx = static_cast<int>(blockIdx.y);
     const int seq_idx = static_cast<int>(blockIdx.z);
     const int head_kv_idx = head_q_idx / (H_q / H_kv);
@@ -78,9 +84,9 @@ kernel_fused_mha_varlen_decode_splitk(
     const int k_end = cu_seqlens_k_ptr[seq_idx + 1];
     const int lk_i = k_end - k_start;
 
-    const int tokens_per_split = (lk_i + num_splits - 1) / num_splits;
-    const int split_start = split_idx * tokens_per_split;
-    const int split_end = min(split_start + tokens_per_split, lk_i);
+    const int tokens_per_split = USE_SPLITK ? ((lk_i + num_splits - 1) / num_splits) : lk_i;
+    const int split_start = USE_SPLITK ? (split_idx * tokens_per_split) : 0;
+    const int split_end = USE_SPLITK ? min(split_start + tokens_per_split, lk_i) : lk_i;
     const int split_len = split_end - split_start;
 
     // Bố trí Dynamic Shared Memory (4,224 bytes) phục vụ gộp 16 -> 1 ở Epilogue
@@ -118,6 +124,12 @@ kernel_fused_mha_varlen_decode_splitk(
         make_layout(Shape<Int<NUM_THREADS>, _1>{}, LayoutRight{}),
         make_layout(Shape<_1, _1>{}, LayoutRight{})));
 
+    // Copy Atom 16x8 LayoutLeft xuất trực tiếp FP16 128-bit (uint4) khi !USE_SPLITK
+    using TiledCopyStoreO_FP16 = decltype(make_tiled_copy(
+        Copy_Atom<UniversalCopy<uint4>, Element>{},
+        make_layout(Shape<_16, _8>{}, LayoutLeft{}),
+        make_layout(Shape<_1, _8>{}, LayoutRight{})));
+
     TiledCopyKV tiled_copy_kv;
     auto thr_copy_kv = tiled_copy_kv.get_thread_slice(tid);
 
@@ -130,6 +142,9 @@ kernel_fused_mha_varlen_decode_splitk(
     TiledCopyStoreLSE tiled_copy_lse;
     auto thr_copy_lse = tiled_copy_lse.get_thread_slice(tid);
 
+    TiledCopyStoreO_FP16 tiled_copy_store_fp16;
+    auto thr_copy_store_fp16 = tiled_copy_store_fp16.get_thread_slice(tid);
+
     const int row_in_tile = tid >> 3;      // 0..15
     const int col_vec = tid & 7;           // 0..7 (8 phần tử FP16 / hàng)
     const bool is_second_half = (col_vec >= 4);
@@ -139,13 +154,13 @@ kernel_fused_mha_varlen_decode_splitk(
     Tensor tOsO_W = thr_copy_f32_16x8.partition_D(sO);
     Tensor tOsO_R = thr_copy_reduce.partition_S(sO);
 
-    // GMEM output buffers cho split hiện tại (chỉ lane row8 == 0 / tid == 0 được ghi qua copy_if)
-    const int64_t lse_part_offset =
-        (static_cast<int64_t>(head_q_idx) * B + seq_idx) * num_splits + split_idx;
+    // GMEM output buffers cho nhánh Split-K vs Direct FP16
+    const int64_t head_seq_idx = static_cast<int64_t>(head_q_idx) * B + seq_idx;
+    const int64_t lse_part_offset = head_seq_idx * num_splits + split_idx;
     const int64_t o_part_offset = lse_part_offset * HEAD_DIM;
 
     Tensor gO_part_bcast = make_tensor(
-        make_gmem_ptr(O_part_ptr + o_part_offset),
+        make_gmem_ptr(USE_SPLITK ? (O_part_ptr + o_part_offset) : nullptr),
         make_shape(_8{}, Int<HEAD_DIM>{}),
         make_stride(_0{}, _1{}));
     Tensor tOgO_part = thr_copy_reduce.partition_D(gO_part_bcast);
@@ -155,7 +170,7 @@ kernel_fused_mha_varlen_decode_splitk(
     tPredStoreO(0, 0) = (row8 == 0);
 
     Tensor gLSE_bcast = make_tensor(
-        make_gmem_ptr(LSE_part_ptr + lse_part_offset),
+        make_gmem_ptr(USE_SPLITK ? (LSE_part_ptr + lse_part_offset) : nullptr),
         make_shape(Int<NUM_THREADS>{}, _1{}),
         make_stride(_0{}, _1{}));
     Tensor tLgLSE = thr_copy_lse.partition_D(gLSE_bcast);
@@ -164,12 +179,27 @@ kernel_fused_mha_varlen_decode_splitk(
     Tensor tPredLeader = make_tensor<bool>(make_shape(size<1>(tLgLSE), size<2>(tLgLSE)));
     tPredLeader(0, 0) = (tid == 0);
 
+    Tensor gO_direct_bcast = make_tensor(
+        make_gmem_ptr(USE_SPLITK ? nullptr : (O_direct_ptr + head_seq_idx * HEAD_DIM)),
+        make_shape(_16{}, Int<HEAD_DIM>{}),
+        make_stride(_0{}, _1{}));
+    Tensor tOgO_direct = thr_copy_store_fp16.partition_D(gO_direct_bcast);
+    Tensor rO_fp16 = make_fragment_like(tOgO_direct);
+    Tensor tPredStoreFP16 = make_tensor<bool>(make_shape(size<1>(tOgO_direct), size<2>(tOgO_direct)));
+    tPredStoreFP16(0, 0) = ((tid & 15) == 0);
+    CUTE_STATIC_ASSERT_V(size(rO_fp16) == Int<8>{});
+
     // Thoát sớm đồng nhất nếu phân đoạn split này rỗng hoặc chuỗi có lk_i == 0
     if (split_len <= 0) {
-        clear(rO_out);
-        rLSE(0) = DECODE_NEG_INF;
-        cute::copy_if(tiled_copy_reduce, tPredStoreO, rO_out, tOgO_part);
-        cute::copy_if(tiled_copy_lse, tPredLeader, rLSE, tLgLSE);
+        if constexpr (USE_SPLITK) {
+            clear(rO_out);
+            rLSE(0) = DECODE_NEG_INF;
+            cute::copy_if(tiled_copy_reduce, tPredStoreO, rO_out, tOgO_part);
+            cute::copy_if(tiled_copy_lse, tPredLeader, rLSE, tLgLSE);
+        } else {
+            clear(rO_fp16);
+            cute::copy_if(tiled_copy_store_fp16, tPredStoreFP16, rO_fp16, tOgO_direct);
+        }
         return;
     }
 
@@ -367,15 +397,33 @@ kernel_fused_mha_varlen_decode_splitk(
     const float l_global = octet_reduce_sum_f32(fmaf(l0, w0, l1 * w1));
     const float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
 
-    CUTE_UNROLL
-    for (int v = 0; v < 4; ++v) {
-        rO_out(v, 0, 0) = octet_reduce_sum_f32(
-            fmaf(rO_pair(v, 0, 0), w0, rO_pair(v, 1, 0) * w1)) * inv_l;
-    }
-    rLSE(0) = (l_global > 0.0f) ? (m_global + logf(l_global)) : DECODE_NEG_INF;
+    if constexpr (USE_SPLITK) {
+        CUTE_UNROLL
+        for (int v = 0; v < 4; ++v) {
+            rO_out(v, 0, 0) = octet_reduce_sum_f32(
+                fmaf(rO_pair(v, 0, 0), w0, rO_pair(v, 1, 0) * w1)) * inv_l;
+        }
+        rLSE(0) = (l_global > 0.0f) ? (m_global + logf(l_global)) : DECODE_NEG_INF;
 
-    cute::copy_if(tiled_copy_reduce, tPredStoreO, rO_out, tOgO_part);
-    cute::copy_if(tiled_copy_lse, tPredLeader, rLSE, tLgLSE);
+        cute::copy_if(tiled_copy_reduce, tPredStoreO, rO_out, tOgO_part);
+        cute::copy_if(tiled_copy_lse, tPredLeader, rLSE, tLgLSE);
+    } else {
+        float o_final[4];
+        CUTE_UNROLL
+        for (int v = 0; v < 4; ++v) {
+            o_final[v] = octet_reduce_sum_f32(
+                fmaf(rO_pair(v, 0, 0), w0, rO_pair(v, 1, 0) * w1)) * inv_l;
+        }
+
+        // Ghép lane col16 chẵn/lẻ trên cùng warp qua __shfl_xor_sync(..., 8), ép FP16 trên thanh ghi (Rule 17)
+        CUTE_UNROLL
+        for (int v = 0; v < 4; ++v) {
+            const float partner_v = __shfl_xor_sync(0xffffffff, o_final[v], 8);
+            rO_fp16(v) = float_to_out<Element>(o_final[v]);
+            rO_fp16(v + 4) = float_to_out<Element>(partner_v);
+        }
+        cute::copy_if(tiled_copy_store_fp16, tPredStoreFP16, rO_fp16, tOgO_direct);
+    }
 }
 
 /*
@@ -544,9 +592,12 @@ kernel_fused_mha_varlen_decode_reduce(
  * Tóm tắt hàm Host fused_mha_varlen_decode:
  *   - Bước 1 (Kiểm tra đầu vào): Xác thực CUDA device, contiguous, dtype (FP16 cho q/k_cache/v_cache/cos/sin,
  *     Int32 cho cu_seqlens_k/offsets), số chiều, head_dim == 64 và tỷ lệ GQA H_q % H_kv == 0.
- *   - Bước 2 (Tính num_splits động & Launch): Đo số SM và occupancy thực tế qua CUDA API để tính num_splits,
- *     cấp phát bộ đệm trung gian (o_part, lse_part) và output o, chạy kernel_fused_mha_varlen_decode_splitk
- *     rồi kernel_fused_mha_varlen_decode_reduce trong các scope cô lập, sau đó giải phóng bộ đệm trung gian.
+ *   - Bước 2 (Adaptive Dispatch theo SM, occupancy & độ lớn dữ liệu KV):
+ *     + Lấy sm_count và max_blocks_per_sm qua CUDA API; tính target_splits = (sm_count * max_blocks_per_sm) / (B * H_q).
+ *     + Khi use_splitk được chỉ định rõ: ép theo giá trị đó. Khi std::nullopt (Auto Dispatch): chỉ bật Split-K
+ *       nếu GPU còn thiếu block (target_splits >= 2), độ dài cho phép chia (>= 2 splits) và max_seqlen_k > 256.
+ *     + Nếu !run_splitk: không cấp phát o_part/lse_part, chạy 1 kernel duy nhất (USE_SPLITK=false) xuất trực tiếp FP16.
+ *     + Nếu run_splitk: chạy kernel_fused_mha_varlen_decode_splitk (USE_SPLITK=true) rồi reduce ở FP32 -> FP16.
  *   - Bước 3 (Hoàn tất): Trả về tensor:
  *       + o: (H_q, B, 64) [FP16]
  */
@@ -558,7 +609,8 @@ at::Tensor fused_mha_varlen_decode(
     int64_t max_seqlen_k,                             // scalar [int64] - Độ dài K lớn nhất trong batch
     const std::optional<at::Tensor>& cos,             // (L_max, 64) [FP16] - Bảng cos RoPE (optional)
     const std::optional<at::Tensor>& sin,             // (L_max, 64) [FP16] - Bảng sin RoPE (optional)
-    const std::optional<at::Tensor>& offsets          // (B,) [Int32] - Offset RoPE từng chuỗi (optional)
+    const std::optional<at::Tensor>& offsets,         // (B,) [Int32] - Offset RoPE từng chuỗi (optional)
+    std::optional<bool> use_splitk                    // scalar [optional<bool>] - Ép nhánh Split-K hoặc Auto Dispatch
 ) {
     // 1. Torch Checks
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
@@ -624,7 +676,7 @@ at::Tensor fused_mha_varlen_decode(
         }
     }
 
-    // 2. Cấu hình tài nguyên GPU động và khởi chạy 2 kernel
+    // 2. Cấu hình tài nguyên GPU động và Adaptive Dispatch (Single-Block Direct vs Split-K)
     const c10::cuda::CUDAGuard device_guard(q.device());
 
     if (B == 0 || max_seqlen_k == 0 || Total_Lk == 0) {
@@ -636,6 +688,7 @@ at::Tensor fused_mha_varlen_decode(
     constexpr int TILE_K_TOKENS = 16;
     constexpr int SPLIT_TILE = 8;
     constexpr int64_t SPLIT_MIN_LEN = 64;
+    constexpr int64_t SHORT_KV_LEN_THRESH = 256;
     constexpr int smem_size_splitk =
         (TILE_K_TOKENS * HEAD_DIM + 2 * TILE_K_TOKENS) * static_cast<int>(sizeof(float));
 
@@ -645,28 +698,44 @@ at::Tensor fused_mha_varlen_decode(
 
     int max_blocks_per_sm = 0;
     if (has_rope) {
-        auto kernel_splitk = kernel_fused_mha_varlen_decode_splitk<
-            HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, true>;
+        auto kernel_occ = kernel_fused_mha_varlen_decode_splitk<
+            HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, true, true>;
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_sm, kernel_splitk, NUM_THREADS, smem_size_splitk));
+            &max_blocks_per_sm, kernel_occ, NUM_THREADS, smem_size_splitk));
     } else {
-        auto kernel_splitk = kernel_fused_mha_varlen_decode_splitk<
-            HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, false>;
+        auto kernel_occ = kernel_fused_mha_varlen_decode_splitk<
+            HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, false, true>;
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_sm, kernel_splitk, NUM_THREADS, smem_size_splitk));
+            &max_blocks_per_sm, kernel_occ, NUM_THREADS, smem_size_splitk));
     }
 
     const int64_t max_concurrent_blocks =
         std::max<int64_t>(1, static_cast<int64_t>(sm_count) * std::max(1, max_blocks_per_sm));
-    const int64_t target_splits = std::max<int64_t>(1, max_concurrent_blocks / (B * H_q));
+    const int64_t base_blocks = B * H_q;
+    const int64_t target_splits =
+        std::max<int64_t>(1, max_concurrent_blocks / std::max<int64_t>(1, base_blocks));
     const int64_t max_possible_splits =
         std::max<int64_t>(1, (max_seqlen_k + SPLIT_MIN_LEN - 1) / SPLIT_MIN_LEN);
-    const int num_splits = static_cast<int>(
-        std::clamp<int64_t>(target_splits, 1, max_possible_splits));
 
-    at::Tensor o_part = at::empty({H_q, B, num_splits, HEAD_DIM}, q.options().dtype(at::kFloat));
-    at::Tensor lse_part = at::empty({H_q, B, num_splits}, q.options().dtype(at::kFloat));
+    const bool run_splitk = use_splitk.has_value()
+        ? use_splitk.value()
+        : ((target_splits >= 2) && (max_possible_splits >= 2) && (max_seqlen_k > SHORT_KV_LEN_THRESH));
+
+    const int num_splits = run_splitk
+        ? static_cast<int>(std::clamp<int64_t>(target_splits, 1, max_possible_splits))
+        : 1;
+
     at::Tensor o = at::empty_like(q);
+    at::Tensor o_part;
+    at::Tensor lse_part;
+    float* o_part_ptr = nullptr;
+    float* lse_part_ptr = nullptr;
+    if (run_splitk) {
+        o_part = at::empty({H_q, B, num_splits, HEAD_DIM}, q.options().dtype(at::kFloat));
+        lse_part = at::empty({H_q, B, num_splits}, q.options().dtype(at::kFloat));
+        o_part_ptr = o_part.data_ptr<float>();
+        lse_part_ptr = lse_part.data_ptr<float>();
+    }
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const float sm_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
@@ -682,62 +751,53 @@ at::Tensor fused_mha_varlen_decode(
         ? reinterpret_cast<const cutlass::half_t*>(sin->data_ptr<at::Half>())
         : nullptr;
     const int32_t* offsets_ptr = offsets.has_value() ? offsets->data_ptr<int32_t>() : nullptr;
-    float* o_part_ptr = o_part.data_ptr<float>();
-    float* lse_part_ptr = lse_part.data_ptr<float>();
     auto* o_ptr = reinterpret_cast<cutlass::half_t*>(o.data_ptr<at::Half>());
 
-    // Kernel 1: Flash Decoding Split-K
-    {
-        const dim3 grid_splitk(
-            static_cast<unsigned int>(num_splits),
+    auto launch_decode_main = [&](auto has_rope_tag, auto use_splitk_tag) {
+        constexpr bool K_ROPE = decltype(has_rope_tag)::value;
+        constexpr bool K_SPLITK = decltype(use_splitk_tag)::value;
+        const dim3 grid_main(
+            static_cast<unsigned int>(K_SPLITK ? num_splits : 1),
             static_cast<unsigned int>(H_q),
             static_cast<unsigned int>(B));
-        const dim3 block_splitk(NUM_THREADS);
-
-        if (has_rope) {
-            auto kernel_splitk = kernel_fused_mha_varlen_decode_splitk<
-                HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, true>;
-            kernel_splitk<<<grid_splitk, block_splitk, smem_size_splitk, stream>>>(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                cu_k_ptr,
-                cos_ptr,
-                sin_ptr,
-                offsets_ptr,
-                o_part_ptr,
-                lse_part_ptr,
-                static_cast<int>(H_q),
-                static_cast<int>(H_kv),
-                static_cast<int>(B),
-                static_cast<int>(Total_Lk),
-                num_splits,
-                sm_scale);
-        } else {
-            auto kernel_splitk = kernel_fused_mha_varlen_decode_splitk<
-                HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, false>;
-            kernel_splitk<<<grid_splitk, block_splitk, smem_size_splitk, stream>>>(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                cu_k_ptr,
-                cos_ptr,
-                sin_ptr,
-                offsets_ptr,
-                o_part_ptr,
-                lse_part_ptr,
-                static_cast<int>(H_q),
-                static_cast<int>(H_kv),
-                static_cast<int>(B),
-                static_cast<int>(Total_Lk),
-                num_splits,
-                sm_scale);
-        }
+        const dim3 block_main(NUM_THREADS);
+        auto kernel_main = kernel_fused_mha_varlen_decode_splitk<
+            HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, K_ROPE, K_SPLITK>;
+        kernel_main<<<grid_main, block_main, smem_size_splitk, stream>>>(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            cu_k_ptr,
+            cos_ptr,
+            sin_ptr,
+            offsets_ptr,
+            o_part_ptr,
+            lse_part_ptr,
+            o_ptr,
+            static_cast<int>(H_q),
+            static_cast<int>(H_kv),
+            static_cast<int>(B),
+            static_cast<int>(Total_Lk),
+            num_splits,
+            sm_scale);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+
+    // Kernel 1: Direct 1-Block FP16 (!run_splitk) hoặc Flash Decoding Split-K (run_splitk)
+    {
+        if (has_rope && run_splitk) {
+            launch_decode_main(std::true_type{}, std::true_type{});
+        } else if (has_rope && !run_splitk) {
+            launch_decode_main(std::true_type{}, std::false_type{});
+        } else if (!has_rope && run_splitk) {
+            launch_decode_main(std::false_type{}, std::true_type{});
+        } else {
+            launch_decode_main(std::false_type{}, std::false_type{});
+        }
     }
 
-    // Kernel 2: Split-K Log-Sum-Exp Reduction
-    {
+    // Kernel 2: Split-K Log-Sum-Exp Reduction (chỉ chạy khi run_splitk == true)
+    if (run_splitk) {
         const dim3 grid_reduce(
             static_cast<unsigned int>(H_q),
             static_cast<unsigned int>(B),
@@ -753,11 +813,11 @@ at::Tensor fused_mha_varlen_decode(
             static_cast<int>(B),
             num_splits);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
 
-    // Giải phóng bộ đệm trung gian Split-K (Rule 5 - Bước 8)
-    o_part = at::Tensor();
-    lse_part = at::Tensor();
+        // Giải phóng bộ đệm trung gian Split-K (Rule 5 - Bước 8)
+        o_part = at::Tensor();
+        lse_part = at::Tensor();
+    }
 
     // 3. Trả về kết quả Attention cuối cùng
     return o;

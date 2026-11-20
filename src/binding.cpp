@@ -46,7 +46,7 @@ TORCH_LIBRARY(varlen_transformer, m) {
         "fused_mha_varlen_decode("
         "Tensor q, Tensor k_cache, Tensor v_cache, "
         "Tensor cu_seqlens_k, int max_seqlen_k, "
-        "Tensor? cos=None, Tensor? sin=None, Tensor? offsets=None"
+        "Tensor? cos=None, Tensor? sin=None, Tensor? offsets=None, bool? use_splitk=None"
         ") -> Tensor"
     );
 }
@@ -120,6 +120,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("max_seqlen_k"),
         py::arg("cos") = py::none(),
         py::arg("sin") = py::none(),
-        py::arg("offsets") = py::none()
+        py::arg("offsets") = py::none(),
+        py::arg("use_splitk") = py::none()
     );
 }

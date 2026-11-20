@@ -215,15 +215,27 @@ def test_varlen_decode_kernels(quick: bool = False, device: Optional[torch.devic
             o_hi = varlen_flash_decode(
                 q, k_cache, v_cache, cu_k, max_k, cos=cos, sin=sin, offsets=offsets
             )
+            o_direct = varlen_flash_decode(
+                q, k_cache, v_cache, cu_k, max_k, cos=cos, sin=sin, offsets=offsets, use_splitk=False
+            )
+            o_splitk = varlen_flash_decode(
+                q, k_cache, v_cache, cu_k, max_k, cos=cos, sin=sin, offsets=offsets, use_splitk=True
+            )
             o_ref = varlen_decode_ref(
                 q, k_cache, v_cache, cu_k, cos=cos, sin=sin, offsets=offsets
             )
 
-        no_nan = bool(torch.isfinite(o_raw).all().item())
+        no_nan = bool(
+            torch.isfinite(o_raw).all().item()
+            and torch.isfinite(o_direct).all().item()
+            and torch.isfinite(o_splitk).all().item()
+        )
         print(f"\n-- Case [{name}] k_lens={k_lens}, H=({h_q},{h_kv}), rope={use_rope}, finite={no_nan} --")
         all_passed &= no_nan
-        all_passed &= check_allclose(f"{name}.decode_raw", o_raw, o_ref, atol=1e-2, rtol=1e-2)[0]
+        all_passed &= check_allclose(f"{name}.decode_auto", o_raw, o_ref, atol=1e-2, rtol=1e-2)[0]
         all_passed &= check_allclose(f"{name}.decode_hi", o_hi, o_ref, atol=1e-2, rtol=1e-2)[0]
+        all_passed &= check_allclose(f"{name}.decode_direct", o_direct, o_ref, atol=1e-2, rtol=1e-2)[0]
+        all_passed &= check_allclose(f"{name}.decode_splitk", o_splitk, o_ref, atol=1e-2, rtol=1e-2)[0]
 
     return all_passed
 

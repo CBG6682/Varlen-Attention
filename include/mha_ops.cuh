@@ -71,24 +71,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_mha_varlen_bwd(
 );
 
 // -----------------------------------------------------------------------------------------
-// 3. Nhánh Inference: Flash Decoding Varlen (Không sử dụng MMA)
+// 3. Nhánh Inference: Flash Decoding Varlen (Không sử dụng MMA, Adaptive Dispatch)
 // -----------------------------------------------------------------------------------------
 // Flow thực thi:
-//   - Tính num_splits động dựa trên SM count và occupancy thực tế của GPU.
-//   - Kernel 1 (splitk): Nạp broadcast q, xoay RoPE tại vị trí (offset + lk_i - 1), nạp K, V
-//     bằng Register Prefetch (Rule 24A), xoay RoPE cho từng token K (vị trí offset + t),
-//     tính dot-product & Online Softmax ở FP32, ghi o_part và lse_part.
-//   - Kernel 2 (reduce): Gộp Log-Sum-Exp chính xác các splits ở FP32 và xuất kết quả o (FP16).
+//   - Rẽ nhánh tự động dựa trên SM count, occupancy (block/SM) và độ lớn dữ liệu KV:
+//     + Khi cache ngắn hoặc batch đủ bão hòa SM (USE_SPLITK=false): chạy 1 block/token q,
+//       ép FP32 -> FP16 trực tiếp trên thanh ghi và ghi ra GMEM (bỏ qua o_part/lse_part & reduce).
+//     + Khi cache dài và thiếu occupancy (USE_SPLITK=true): tính num_splits động, chạy Split-K
+//       ghi o_part/lse_part rồi gộp bằng kernel_fused_mha_varlen_decode_reduce.
 // Outputs:
 //   1. o: (H_q, B, 64) [FP16] - Kết quả Attention đầu ra cho bước decode Lq = 1
 // -----------------------------------------------------------------------------------------
 at::Tensor fused_mha_varlen_decode(
-    const at::Tensor& q,                              // (H_q, B, 64) [FP16] - Query decode hiện tại
-    const at::Tensor& k_cache,                        // (H_kv, Total_Lk, 64) [FP16] - Raw Key cache packed
-    const at::Tensor& v_cache,                        // (H_kv, Total_Lk, 64) [FP16] - Value cache packed
-    const at::Tensor& cu_seqlens_k,                   // (B + 1,) [Int32] - Độ dài tích lũy của K, V
-    int64_t max_seqlen_k,                             // scalar [int64] - Độ dài K lớn nhất trong batch
+    const at::Tensor& q,                                     // (H_q, B, 64) [FP16] - Query decode hiện tại
+    const at::Tensor& k_cache,                               // (H_kv, Total_Lk, 64) [FP16] - Raw Key cache packed
+    const at::Tensor& v_cache,                               // (H_kv, Total_Lk, 64) [FP16] - Value cache packed
+    const at::Tensor& cu_seqlens_k,                          // (B + 1,) [Int32] - Độ dài tích lũy của K, V
+    int64_t max_seqlen_k,                                    // scalar [int64] - Độ dài K lớn nhất trong batch
     const std::optional<at::Tensor>& cos = std::nullopt,     // (L_max, 64) [FP16] - Bảng cos RoPE (optional)
     const std::optional<at::Tensor>& sin = std::nullopt,     // (L_max, 64) [FP16] - Bảng sin RoPE (optional)
-    const std::optional<at::Tensor>& offsets = std::nullopt  // (B,) [Int32] - Offset RoPE cho từng chuỗi (optional)
+    const std::optional<at::Tensor>& offsets = std::nullopt, // (B,) [Int32] - Offset RoPE cho từng chuỗi (optional)
+    std::optional<bool> use_splitk = std::nullopt            // scalar [optional<bool>] - Bật/tắt Split-K (None = Auto)
 );

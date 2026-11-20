@@ -97,6 +97,7 @@ if HAS_CUDA_EXT and _register_fake is not None:
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
         offsets: Optional[torch.Tensor] = None,
+        use_splitk: Optional[bool] = None,
     ) -> torch.Tensor:
         return torch.empty_like(q)
 
@@ -176,8 +177,9 @@ def fused_mha_varlen_decode(
     cos: Optional[torch.Tensor] = None,
     sin: Optional[torch.Tensor] = None,
     offsets: Optional[torch.Tensor] = None,
+    use_splitk: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Raw dispatcher wrapper for Split-K varlen Flash Decoding (Lq = 1)."""
+    """Raw dispatcher wrapper for Split-K / Direct varlen Flash Decoding (Lq = 1)."""
     _require_cuda_ext()
     return torch.ops.varlen_transformer.fused_mha_varlen_decode(
         q.contiguous(),
@@ -188,6 +190,7 @@ def fused_mha_varlen_decode(
         _contiguous_or_none(cos),
         _contiguous_or_none(sin),
         _contiguous_or_none(offsets),
+        None if use_splitk is None else bool(use_splitk),
     )
 
 
@@ -309,6 +312,7 @@ def varlen_flash_decode(
     cos: Optional[torch.Tensor] = None,
     sin: Optional[torch.Tensor] = None,
     offsets: Optional[torch.Tensor] = None,
+    use_splitk: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     Variable-length Flash Decoding (Lq = 1) with fused RoPE on raw unrotated KV cache.
@@ -322,6 +326,8 @@ def varlen_flash_decode(
         cos: Optional (L_max, 64) float16
         sin: Optional (L_max, 64) float16
         offsets: Optional (B,) int32 RoPE position offsets per sequence
+        use_splitk: Optional bool to force Split-K (True) or Single-Block Direct FP16 (False);
+            None uses SM/occupancy/length adaptive dispatch.
     Returns:
         o: (H_q, B, 64) float16
     """
@@ -339,6 +345,7 @@ def varlen_flash_decode(
         _contiguous_or_none(cos),
         _contiguous_or_none(sin),
         _contiguous_or_none(offsets),
+        None if use_splitk is None else bool(use_splitk),
     )
 
 
