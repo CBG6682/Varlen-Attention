@@ -212,16 +212,16 @@ kernel_fused_mha_varlen_bwd(
 
     using TiledCopyG2R = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint4>, Element>{},
-        Layout<Shape<_32, _8>, LayoutRight>{},
-        Layout<Shape<_1, _8>, LayoutRight>{}));
+        make_layout(Shape<_32, _8>{}, LayoutRight{}),
+        make_layout(Shape<_1, _8>{}, LayoutRight{})));
     using TiledCopyF32 = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint4>, float>{},
-        Layout<Shape<_16, _16>, LayoutRight>{},
-        Layout<Shape<_1, _4>, LayoutRight>{}));
+        make_layout(Shape<_16, _16>{}, LayoutRight{}),
+        make_layout(Shape<_1, _4>{}, LayoutRight{})));
     using TiledCopyFP16_16x16 = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint2>, Element>{},
-        Layout<Shape<_16, _16>, LayoutRight>{},
-        Layout<Shape<_1, _4>, LayoutRight>{}));
+        make_layout(Shape<_16, _16>{}, LayoutRight{}),
+        make_layout(Shape<_1, _4>{}, LayoutRight{})));
 
     using MMA_Op = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
     using TiledMMA = decltype(make_tiled_mma(MMA_Op{}, Layout<Shape<_4, _2, _1>>{}));

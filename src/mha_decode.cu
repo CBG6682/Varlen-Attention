@@ -97,26 +97,26 @@ kernel_fused_mha_varlen_decode_splitk(
     // Copy Atom 16x8 LayoutRight: mỗi hàng 16 token do 8 threads nạp (8 halfs = 1 uint4/thread)
     using TiledCopyKV = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint4>, Element>{},
-        Layout<Shape<_16, _8>, LayoutRight>{},
-        Layout<Shape<_1, _8>, LayoutRight>{}));
+        make_layout(Shape<_16, _8>{}, LayoutRight{}),
+        make_layout(Shape<_1, _8>{}, LayoutRight{})));
 
     // Copy Atom 16x8 FP32 ghi o_acc từ thanh ghi xuống sO
     using TiledCopyF32_16x8 = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint4>, float>{},
-        Layout<Shape<_16, _8>, LayoutRight>{},
-        Layout<Shape<_1, _8>, LayoutRight>{}));
+        make_layout(Shape<_16, _8>{}, LayoutRight{}),
+        make_layout(Shape<_1, _8>{}, LayoutRight{})));
 
     // Copy Atom 8x16 LayoutLeft đọc sO để giảm 16 -> 1 theo 8 cặp hàng song song và ghi gO_part
     using TiledCopyReduceRead = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint4>, float>{},
-        Layout<Shape<_8, _16>, LayoutLeft>{},
-        Layout<Shape<_1, _4>, LayoutRight>{}));
+        make_layout(Shape<_8, _16>{}, LayoutLeft{}),
+        make_layout(Shape<_1, _4>{}, LayoutRight{})));
 
     // Copy Atom 1D ghi LSE_part qua predication leader (Rule 14)
     using TiledCopyStoreLSE = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<float>, float>{},
-        Layout<Shape<Int<NUM_THREADS>, _1>, LayoutRight>{},
-        Layout<Shape<_1, _1>, LayoutRight>{}));
+        make_layout(Shape<Int<NUM_THREADS>, _1>{}, LayoutRight{}),
+        make_layout(Shape<_1, _1>{}, LayoutRight{})));
 
     TiledCopyKV tiled_copy_kv;
     auto thr_copy_kv = tiled_copy_kv.get_thread_slice(tid);
@@ -409,12 +409,12 @@ kernel_fused_mha_varlen_decode_reduce(
     using Element = cutlass::half_t;
     using TiledCopyOpartF32 = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint4>, float>{},
-        Layout<Shape<Int<SPLIT_TILE>, _16>, LayoutLeft>{},
-        Layout<Shape<_1, _4>, LayoutRight>{}));
+        make_layout(Shape<Int<SPLIT_TILE>, _16>{}, LayoutLeft{}),
+        make_layout(Shape<_1, _4>{}, LayoutRight{})));
     using TiledCopyStoreO_FP16 = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<uint4>, Element>{},
-        Layout<Shape<_16, _8>, LayoutLeft>{},
-        Layout<Shape<_1, _8>, LayoutRight>{}));
+        make_layout(Shape<_16, _8>{}, LayoutLeft{}),
+        make_layout(Shape<_1, _8>{}, LayoutRight{})));
 
     TiledCopyOpartF32 tiled_copy_opart;
     auto thr_copy_opart = tiled_copy_opart.get_thread_slice(tid);
