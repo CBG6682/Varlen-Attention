@@ -1,0 +1,30 @@
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# Track pre-compiled binary extension and wheel distributions
+!varlen_transformer/_C*.so
+!wheels/
+!wheels/*.whl
+
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+
+# Third-party CUTLASS clone / submodule working tree
+/cutlass/
+third_party/cutlass/
+
+# Local prompt, checkpoints, and Nsight Compute profiles (do not publish)
+Prompt/
+prompt/
+*.ncu-rep
+.ipynb_checkpoints/
+.vscode/
+.idea/
