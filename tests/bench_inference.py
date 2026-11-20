@@ -31,6 +31,7 @@ from varlen_transformer import (
     VarlenFlashGQA,
     VarlenKVCache,
     varlen_flash_decode,
+    varlen_kv_append,
 )
 
 
@@ -389,7 +390,7 @@ def run_inference_benchmark(
                     ]
                 )
 
-                del q_dec, k_packed, v_packed, q_batched, k_batched, v_batched, pad_mask
+                del q_dec, k_packed, v_packed, q_batched, q_batched_roped, k_batched, v_batched, pad_mask
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -441,27 +442,32 @@ def run_inference_benchmark(
     if include_compile:
         def _c_varlen_step(x_step, k_cache, v_cache, cu_seqlens_k, max_k, cos_t, sin_t, offsets_t):
             q, new_k, new_v = mod_varlen._project_qkv_decode(x_step)
+            k_next, v_next, cu_next = varlen_kv_append(k_cache, v_cache, cu_seqlens_k, new_k, new_v)
             attn_out = varlen_flash_decode(
-                q, k_cache, v_cache, cu_seqlens_k, max_seqlen_k=max_k, cos=cos_t, sin=sin_t, offsets=offsets_t
+                q, k_next, v_next, cu_next, max_seqlen_k=max_k, cos=cos_t, sin=sin_t, offsets=offsets_t
             )
             out_flat = attn_out.transpose(0, 1).contiguous().view(x_step.shape[0], -1)
-            return mod_varlen.out_proj(out_flat), new_k, new_v
+            return mod_varlen.out_proj(out_flat), k_next, v_next, cu_next
 
         compiled_varlen_step_fn = _compile_or_warn(_c_varlen_step, "varlen_decode_step")
 
-        def _c_batched_step(x_step, past_k, past_v, offset_val):
+        def _c_batched_step(x_step, past_k, past_v, step_mask, offset_t):
             qkv = mod_batched.qkv_proj(x_step)
             B_sz = x_step.shape[0]
-            qkv = qkv.view(B_sz, 1, mod_batched.num_heads_q + 2 * mod_batched.num_heads_kv, mod_batched.head_dim).transpose(1, 2)
-            q, k, v = qkv.split([mod_batched.num_heads_q, mod_batched.num_heads_kv, mod_batched.num_heads_kv], dim=1)
+            qkv = qkv.view(
+                B_sz, 1, mod_batched.num_heads_q + 2 * mod_batched.num_heads_kv, mod_batched.head_dim
+            ).transpose(1, 2)
+            q, k, v = qkv.split(
+                [mod_batched.num_heads_q, mod_batched.num_heads_kv, mod_batched.num_heads_kv], dim=1
+            )
             if mod_batched.rope is not None:
-                q = mod_batched.rope(q, offset=offset_val)
-                k = mod_batched.rope(k, offset=offset_val)
+                q = mod_batched.rope(q, offset=offset_t)
+                k = mod_batched.rope(k, offset=offset_t)
             k_all = torch.cat([past_k, k], dim=2)
             v_all = torch.cat([past_v, v], dim=2)
             k_exp = _repeat_kv_batched(k_all, rep_gqa)
             v_exp = _repeat_kv_batched(v_all, rep_gqa)
-            out = F.scaled_dot_product_attention(q, k_exp, v_exp, scale=scale)
+            out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=step_mask, scale=scale)
             out_flat = out.transpose(1, 2).contiguous().view(B_sz, 1, -1)
             return mod_batched.out_proj(out_flat), k_all, v_all
 
@@ -514,82 +520,83 @@ def run_inference_benchmark(
         total_tokens = int(cu_seqlens[-1].item())
         pad_waste_pct = (1.0 - float(total_tokens) / float(B * actual_max)) * 100.0
 
+        # Allocate padded inputs FIRST (isolated from Varlen tensors for clean VRAM measurements)
         x_prefill_b = torch.randn((B, actual_max, embed_dim), device=dev, dtype=torch.float16)
+        pos_prefill = torch.arange(actual_max, device=dev, dtype=torch.int32).unsqueeze(0)
+        valid_prefill_tok = pos_prefill < seqlens.unsqueeze(1)
+        x_prefill_b = x_prefill_b * valid_prefill_tok.unsqueeze(-1).to(dtype=torch.float16)
+
+        x_step_b = torch.randn((B, 1, embed_dim), device=dev, dtype=torch.float16)
         x_prefill_p = pack_varlen_tensor(x_prefill_b, cu_seqlens)
-        x_step_p = torch.randn((B, embed_dim), device=dev, dtype=torch.float16)
-        x_step_b = x_step_p.unsqueeze(1)  # (B, 1, embed_dim)
+        x_step_p = x_step_b.squeeze(1).contiguous()
 
-        cos_t, sin_t = mod_varlen._resolve_rope_tables(actual_max + gen_steps + 32, dev, torch.float16)
+        # Exact padding + generated token mask for Batched Decode: (B, 1, 1, actual_max + gen_steps)
+        total_kv_cap = actual_max + gen_steps
+        pos_dec = torch.arange(total_kv_cap, device=dev, dtype=torch.int32).unsqueeze(0)
+        full_dec_mask = ((pos_dec < seqlens.unsqueeze(1)) | (pos_dec >= actual_max)).view(
+            B, 1, 1, total_kv_cap
+        )
+        step_masks = [full_dec_mask[:, :, :, : actual_max + step + 1] for step in range(gen_steps)]
+        offset_tensors = [
+            torch.tensor(actual_max + step, device=dev, dtype=torch.int64) for step in range(gen_steps)
+        ]
 
         # ---------------------------------------------------------------------
-        # 1. COMPILED E2E (Batched Baseline vs Varlen Custom Kernel)
+        # 1. BATCНED PIPELINE (Isolated Phase 1 — delete Varlen inputs temporarily or keep packed CPU?)
+        # Keep packed small tensors on CPU until Phase 2 so GPU VRAM reflects only Batched allocations!
         # ---------------------------------------------------------------------
+        x_prefill_p_cpu = x_prefill_p.cpu()
+        x_step_p_cpu = x_step_p.cpu()
+        del x_prefill_p, x_step_p
+        gc.collect()
+        torch.cuda.empty_cache()
+
         b_comp_ttft_ms: Optional[float] = None
         b_comp_tpot_ms: Optional[float] = None
         b_comp_e2e_ms: Optional[float] = None
-        v_comp_ttft_ms: Optional[float] = None
-        v_comp_tpot_ms: Optional[float] = None
-        v_comp_e2e_ms: Optional[float] = None
+        has_batched_comp = mod_batched_comp is not None and compiled_batched_step_fn is not None
 
-        if mod_batched_comp is not None and compiled_batched_step_fn is not None:
+        if has_batched_comp:
             def _batched_comp_ttft_fn():
                 with torch.no_grad():
-                    return mod_batched_comp(x_prefill_b, is_causal=True)
+                    return mod_batched_comp(x_prefill_b, is_causal=True, use_cache=True)
 
             def _batched_comp_e2e_fn():
                 with torch.no_grad():
-                    qkv = mod_batched.qkv_proj(x_prefill_b)
-                    B_sz, L_sz, _ = x_prefill_b.shape
-                    qkv = qkv.view(B_sz, L_sz, mod_batched.num_heads_q + 2 * mod_batched.num_heads_kv, mod_batched.head_dim).transpose(1, 2)
-                    q, k, v = qkv.split([mod_batched.num_heads_q, mod_batched.num_heads_kv, mod_batched.num_heads_kv], dim=1)
-                    if mod_batched.rope is not None:
-                        q = mod_batched.rope(q, offset=0)
-                        k = mod_batched.rope(k, offset=0)
-                    past_k, past_v = k, v
+                    _, (past_k, past_v) = mod_batched_comp(x_prefill_b, is_causal=True, use_cache=True)
                     for step in range(gen_steps):
-                        _, past_k, past_v = compiled_batched_step_fn(x_step_b, past_k, past_v, actual_max + step)
+                        _, past_k, past_v = compiled_batched_step_fn(
+                            x_step_b, past_k, past_v, step_masks[step], offset_tensors[step]
+                        )
                     return past_k, past_v
 
-            b_comp_ttft_ms, _, _ = cuda_benchmark(_batched_comp_ttft_fn, warmup=max(4, warmup // 3), rep=min(25, rep))
-            b_comp_e2e_ms, _, _ = cuda_benchmark(_batched_comp_e2e_fn, warmup=max(4, warmup // 3), rep=min(20, rep), clear_l2=clear_l2)
-            b_comp_tpot_ms = max(0.0, b_comp_e2e_ms - b_comp_ttft_ms) / float(gen_steps)
+            b_comp_ttft_ms, _, _ = cuda_benchmark(
+                _batched_comp_ttft_fn, warmup=max(4, warmup // 3), rep=min(25, rep)
+            )
+            b_comp_e2e_ms, _, _ = cuda_benchmark(
+                _batched_comp_e2e_fn, warmup=max(4, warmup // 3), rep=min(20, rep), clear_l2=clear_l2
+            )
+            torch.cuda.empty_cache()
+            _, b_vram_mb = measure_peak_memory_mb(_batched_comp_e2e_fn)
 
-        if mod_varlen_comp is not None and compiled_varlen_step_fn is not None:
-            def _varlen_comp_ttft_fn():
-                with torch.no_grad():
-                    return mod_varlen_comp(
-                        x_prefill_p,
-                        cu_seqlens_q=cu_seqlens,
-                        max_seqlen_q=actual_max,
-                        max_seqlen_k=actual_max,
-                        is_causal=True,
-                    )
+            with torch.no_grad():
+                _, (init_b_k, init_b_v) = mod_batched_comp(x_prefill_b, is_causal=True, use_cache=True)
 
-            def _varlen_comp_e2e_fn():
+            def _batched_comp_gen_fn():
                 with torch.no_grad():
-                    q, k, v, cu_k, _ = mod_varlen._project_qkv_packed(x_prefill_p, cu_seqlens)
-                    v_cache = VarlenKVCache.from_packed(k, v, cu_k, actual_max)
+                    past_k, past_v = init_b_k, init_b_v
                     for step in range(gen_steps):
-                        _, new_k, new_v = compiled_varlen_step_fn(
-                            x_step_p,
-                            v_cache.k_cache,
-                            v_cache.v_cache,
-                            v_cache.cu_seqlens_k,
-                            v_cache.max_seqlen_k,
-                            cos_t,
-                            sin_t,
-                            v_cache.offsets,
+                        _, past_k, past_v = compiled_batched_step_fn(
+                            x_step_b, past_k, past_v, step_masks[step], offset_tensors[step]
                         )
-                        v_cache.append(new_k, new_v)
-                    return v_cache
+                    return past_k, past_v
 
-            v_comp_ttft_ms, _, _ = cuda_benchmark(_varlen_comp_ttft_fn, warmup=max(4, warmup // 3), rep=min(25, rep))
-            v_comp_e2e_ms, _, _ = cuda_benchmark(_varlen_comp_e2e_fn, warmup=max(4, warmup // 3), rep=min(20, rep), clear_l2=clear_l2)
-            v_comp_tpot_ms = max(0.0, v_comp_e2e_ms - v_comp_ttft_ms) / float(gen_steps)
+            b_comp_gen_ms, _, _ = cuda_benchmark(
+                _batched_comp_gen_fn, warmup=max(4, warmup // 3), rep=min(25, rep), clear_l2=clear_l2
+            )
+            b_comp_tpot_ms = b_comp_gen_ms / float(gen_steps)
+            del init_b_k, init_b_v
 
-        # ---------------------------------------------------------------------
-        # 2. EAGER E2E (Batched Baseline vs Varlen Custom Kernel)
-        # ---------------------------------------------------------------------
         def _batched_eager_ttft_fn():
             with torch.no_grad():
                 return mod_batched(x_prefill_b, is_causal=True, use_cache=True)
@@ -599,14 +606,152 @@ def run_inference_benchmark(
                 _, b_cache = mod_batched(x_prefill_b, is_causal=True, use_cache=True)
                 for step in range(gen_steps):
                     _, b_cache = mod_batched(
-                        x_step_b, kv_cache=b_cache, use_cache=True, offset=actual_max + step
+                        x_step_b,
+                        attn_mask=step_masks[step],
+                        kv_cache=b_cache,
+                        use_cache=True,
+                        offset=offset_tensors[step],
                     )
                 return b_cache
 
         b_eager_ttft_ms, _, _ = cuda_benchmark(_batched_eager_ttft_fn, warmup=warmup // 2, rep=min(25, rep))
-        _, b_vram_mb = measure_peak_memory_mb(_batched_eager_e2e_fn)
-        b_eager_e2e_ms, _, _ = cuda_benchmark(_batched_eager_e2e_fn, warmup=4, rep=min(20, rep), clear_l2=clear_l2)
-        b_eager_tpot_ms = max(0.0, b_eager_e2e_ms - b_eager_ttft_ms) / float(gen_steps)
+        b_eager_e2e_ms, _, _ = cuda_benchmark(
+            _batched_eager_e2e_fn, warmup=4, rep=min(20, rep), clear_l2=clear_l2
+        )
+        if not has_batched_comp:
+            torch.cuda.empty_cache()
+            _, b_vram_mb = measure_peak_memory_mb(_batched_eager_e2e_fn)
+
+        with torch.no_grad():
+            _, init_b_eager_cache = mod_batched(x_prefill_b, is_causal=True, use_cache=True)
+
+        def _batched_eager_gen_fn():
+            with torch.no_grad():
+                b_cache = init_b_eager_cache
+                for step in range(gen_steps):
+                    _, b_cache = mod_batched(
+                        x_step_b,
+                        attn_mask=step_masks[step],
+                        kv_cache=b_cache,
+                        use_cache=True,
+                        offset=offset_tensors[step],
+                    )
+                return b_cache
+
+        b_eager_gen_ms, _, _ = cuda_benchmark(
+            _batched_eager_gen_fn, warmup=4, rep=min(25, rep), clear_l2=clear_l2
+        )
+        b_eager_tpot_ms = b_eager_gen_ms / float(gen_steps)
+
+        # Free ALL Batched GPU tensors before running Varlen Phase 2
+        del (
+            x_prefill_b,
+            x_step_b,
+            full_dec_mask,
+            step_masks,
+            offset_tensors,
+            init_b_eager_cache,
+            pos_prefill,
+            valid_prefill_tok,
+            pos_dec,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # ---------------------------------------------------------------------
+        # 2. VARLEN PIPELINE (Isolated Phase 2 — zero Batched buffers in VRAM)
+        # ---------------------------------------------------------------------
+        x_prefill_p = x_prefill_p_cpu.to(device=dev)
+        x_step_p = x_step_p_cpu.to(device=dev)
+        del x_prefill_p_cpu, x_step_p_cpu
+
+        cos_t, sin_t = mod_varlen._resolve_rope_tables(actual_max + gen_steps + 32, dev, torch.float16)
+
+        v_comp_ttft_ms: Optional[float] = None
+        v_comp_tpot_ms: Optional[float] = None
+        v_comp_e2e_ms: Optional[float] = None
+        has_varlen_comp = mod_varlen_comp is not None and compiled_varlen_step_fn is not None
+
+        if has_varlen_comp:
+            def _varlen_comp_ttft_fn():
+                with torch.no_grad():
+                    return mod_varlen_comp(
+                        x_prefill_p,
+                        cu_seqlens_q=cu_seqlens,
+                        max_seqlen_q=actual_max,
+                        max_seqlen_k=actual_max,
+                        is_causal=True,
+                        use_cache=True,
+                    )
+
+            def _varlen_comp_e2e_fn():
+                with torch.no_grad():
+                    _, v_cache = mod_varlen_comp(
+                        x_prefill_p,
+                        cu_seqlens_q=cu_seqlens,
+                        max_seqlen_q=actual_max,
+                        max_seqlen_k=actual_max,
+                        is_causal=True,
+                        use_cache=True,
+                    )
+                    cur_k = v_cache.k_cache
+                    cur_v = v_cache.v_cache
+                    cur_cu = v_cache.cu_seqlens_k
+                    for step in range(gen_steps):
+                        _, cur_k, cur_v, cur_cu = compiled_varlen_step_fn(
+                            x_step_p,
+                            cur_k,
+                            cur_v,
+                            cur_cu,
+                            actual_max + step + 1,
+                            cos_t,
+                            sin_t,
+                            v_cache.offsets,
+                        )
+                    return cur_k, cur_v, cur_cu
+
+            v_comp_ttft_ms, _, _ = cuda_benchmark(
+                _varlen_comp_ttft_fn, warmup=max(4, warmup // 3), rep=min(25, rep)
+            )
+            v_comp_e2e_ms, _, _ = cuda_benchmark(
+                _varlen_comp_e2e_fn, warmup=max(4, warmup // 3), rep=min(20, rep), clear_l2=clear_l2
+            )
+            torch.cuda.empty_cache()
+            _, v_vram_mb = measure_peak_memory_mb(_varlen_comp_e2e_fn)
+
+            with torch.no_grad():
+                _, init_v_cache = mod_varlen_comp(
+                    x_prefill_p,
+                    cu_seqlens_q=cu_seqlens,
+                    max_seqlen_q=actual_max,
+                    max_seqlen_k=actual_max,
+                    is_causal=True,
+                    use_cache=True,
+                )
+
+            def _varlen_comp_gen_fn():
+                with torch.no_grad():
+                    cur_k = init_v_cache.k_cache
+                    cur_v = init_v_cache.v_cache
+                    cur_cu = init_v_cache.cu_seqlens_k
+                    for step in range(gen_steps):
+                        _, cur_k, cur_v, cur_cu = compiled_varlen_step_fn(
+                            x_step_p,
+                            cur_k,
+                            cur_v,
+                            cur_cu,
+                            actual_max + step + 1,
+                            cos_t,
+                            sin_t,
+                            init_v_cache.offsets,
+                        )
+                    return cur_k, cur_v, cur_cu
+
+            v_comp_gen_ms, _, _ = cuda_benchmark(
+                _varlen_comp_gen_fn, warmup=max(4, warmup // 3), rep=min(25, rep), clear_l2=clear_l2
+            )
+            v_comp_tpot_ms = v_comp_gen_ms / float(gen_steps)
+            del init_v_cache
 
         def _varlen_eager_ttft_fn():
             with torch.no_grad():
@@ -634,9 +779,41 @@ def run_inference_benchmark(
                 return v_cache
 
         v_eager_ttft_ms, _, _ = cuda_benchmark(_varlen_eager_ttft_fn, warmup=warmup // 2, rep=min(25, rep))
-        _, v_vram_mb = measure_peak_memory_mb(_varlen_eager_e2e_fn)
-        v_eager_e2e_ms, _, _ = cuda_benchmark(_varlen_eager_e2e_fn, warmup=4, rep=min(20, rep), clear_l2=clear_l2)
-        v_eager_tpot_ms = max(0.0, v_eager_e2e_ms - v_eager_ttft_ms) / float(gen_steps)
+        v_eager_e2e_ms, _, _ = cuda_benchmark(
+            _varlen_eager_e2e_fn, warmup=4, rep=min(20, rep), clear_l2=clear_l2
+        )
+        if not has_varlen_comp:
+            torch.cuda.empty_cache()
+            _, v_vram_mb = measure_peak_memory_mb(_varlen_eager_e2e_fn)
+
+        with torch.no_grad():
+            _, init_v_eager_cache = mod_varlen(
+                x_prefill_p,
+                cu_seqlens_q=cu_seqlens,
+                max_seqlen_q=actual_max,
+                max_seqlen_k=actual_max,
+                is_causal=True,
+                use_cache=True,
+            )
+
+        def _varlen_eager_gen_fn():
+            with torch.no_grad():
+                v_cache = VarlenKVCache(
+                    init_v_eager_cache.k_cache,
+                    init_v_eager_cache.v_cache,
+                    init_v_eager_cache.cu_seqlens_k,
+                    max_seqlen_k=init_v_eager_cache.max_seqlen_k,
+                    offsets=init_v_eager_cache.offsets,
+                )
+                for _ in range(gen_steps):
+                    _, v_cache = mod_varlen(x_step_p, kv_cache=v_cache, use_cache=True, decode=True)
+                return v_cache
+
+        v_eager_gen_ms, _, _ = cuda_benchmark(
+            _varlen_eager_gen_fn, warmup=4, rep=min(25, rep), clear_l2=clear_l2
+        )
+        v_eager_tpot_ms = v_eager_gen_ms / float(gen_steps)
+        del init_v_eager_cache
 
         # Speedups
         has_comp = (
@@ -706,7 +883,7 @@ def run_inference_benchmark(
             ]
         )
 
-        del x_prefill_b, x_prefill_p, x_step_p, x_step_b
+        del x_prefill_p, x_step_p
         gc.collect()
         torch.cuda.empty_cache()
 

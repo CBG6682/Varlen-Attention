@@ -9,6 +9,7 @@ from varlen_transformer.model import (
     VarlenKVCache,
     varlen_attention_ref,
     varlen_decode_ref,
+    varlen_kv_append,
 )
 from varlen_transformer.ops import (
     HAS_CUDA_EXT,
@@ -31,6 +32,7 @@ __all__ = [
     "varlen_flash_decode",
     "RotaryPositionalEmbedding",
     "VarlenKVCache",
+    "varlen_kv_append",
     "varlen_attention_ref",
     "varlen_decode_ref",
     "VarlenFlashGQA",

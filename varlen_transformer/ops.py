@@ -32,6 +32,16 @@ def _infer_max_seqlen(cu_seqlens: torch.Tensor) -> int:
     return int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
 
 
+_SYMINT_TYPE = getattr(torch, "SymInt", ())
+
+
+def _preserve_symint(val: int) -> int:
+    """Convert numeric scalars to Python int while keeping torch.SymInt symbolic for Dynamo."""
+    if _SYMINT_TYPE and isinstance(val, _SYMINT_TYPE):
+        return val
+    return int(val)
+
+
 # =========================================================================================
 # FakeTensor / Meta Kernel Registrations for torch.compile & TorchInductor
 # =========================================================================================
@@ -115,7 +125,7 @@ def fused_mha_varlen_fwd(
         v.contiguous(),
         cu_seqlens_q.contiguous(),
         cu_seqlens_k.contiguous(),
-        int(max_seqlen_q),
+        _preserve_symint(max_seqlen_q),
         _contiguous_or_none(cos),
         _contiguous_or_none(sin),
         bool(is_causal),
@@ -150,7 +160,7 @@ def fused_mha_varlen_bwd(
         cu_seqlens_q.contiguous(),
         cu_seqlens_k.contiguous(),
         _contiguous_or_none(offsets),
-        int(max_seqlen_k),
+        _preserve_symint(max_seqlen_k),
         _contiguous_or_none(cos),
         _contiguous_or_none(sin),
         bool(is_causal),
@@ -174,7 +184,7 @@ def fused_mha_varlen_decode(
         k_cache.contiguous(),
         v_cache.contiguous(),
         cu_seqlens_k.contiguous(),
-        int(max_seqlen_k),
+        _preserve_symint(max_seqlen_k),
         _contiguous_or_none(cos),
         _contiguous_or_none(sin),
         _contiguous_or_none(offsets),
@@ -205,7 +215,7 @@ class _VarlenFlashAttentionFunc(torch.autograd.Function):
             q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, cos, sin, is_causal, offsets
         )
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens_q, cu_seqlens_k, cos, sin, offsets)
-        ctx.max_seqlen_k = int(max_seqlen_k)
+        ctx.max_seqlen_k = _preserve_symint(max_seqlen_k)
         ctx.is_causal = bool(is_causal)
         return o
 
@@ -281,8 +291,8 @@ def varlen_flash_attention(
         v.contiguous(),
         cu_q,
         cu_k,
-        int(max_seqlen_q),
-        int(max_seqlen_k),
+        _preserve_symint(max_seqlen_q),
+        _preserve_symint(max_seqlen_k),
         _contiguous_or_none(cos),
         _contiguous_or_none(sin),
         bool(is_causal),
@@ -325,7 +335,7 @@ def varlen_flash_decode(
         k_cache.contiguous(),
         v_cache.contiguous(),
         cu_k,
-        int(max_seqlen_k),
+        _preserve_symint(max_seqlen_k),
         _contiguous_or_none(cos),
         _contiguous_or_none(sin),
         _contiguous_or_none(offsets),

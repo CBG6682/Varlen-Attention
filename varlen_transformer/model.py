@@ -94,17 +94,20 @@ class RotaryPositionalEmbedding(nn.Module):
         if self.interleaved:
             raise ValueError("CUDA fused RoPE kernels require interleaved=False")
 
-        target_len = self._seq_len_cached if seq_len is None else int(seq_len)
-        if target_len == 0:
-            target_len = self.max_seq_len
-
         target_device = device if device is not None else self.inv_freq.device
-        if (
-            self.cos_cached is None
-            or target_len > self._seq_len_cached
-            or self.cos_cached.device != target_device
-        ):
-            self._build_cache(max(target_len, self.max_seq_len), device=target_device)
+        target_len = self._seq_len_cached if seq_len is None else seq_len
+        if self.cos_cached is None or self.cos_cached.device != target_device:
+            build_len = (
+                self.max_seq_len
+                if (seq_len is None or not isinstance(seq_len, int))
+                else max(seq_len, self.max_seq_len)
+            )
+            self._build_cache(build_len, device=target_device)
+        elif isinstance(target_len, int):
+            if target_len == 0:
+                target_len = self.max_seq_len
+            if target_len > self._seq_len_cached:
+                self._build_cache(max(target_len, self.max_seq_len), device=target_device)
 
         if dtype == torch.float16:
             if (
@@ -125,21 +128,33 @@ class RotaryPositionalEmbedding(nn.Module):
         self,
         x: torch.Tensor,
         seq_len: Optional[int] = None,
-        offset: int = 0,
+        offset: Union[int, torch.Tensor] = 0,
     ) -> torch.Tensor:
         if seq_len is None:
             seq_len = x.shape[-2]
 
-        needed = offset + seq_len
-        if (
-            self.cos_cached is None
-            or needed > self._seq_len_cached
-            or self.cos_cached.device != x.device
-        ):
-            self._build_cache(max(needed, self.max_seq_len), device=x.device)
+        if isinstance(offset, torch.Tensor):
+            if self.cos_cached is None or self.cos_cached.device != x.device:
+                self._build_cache(self.max_seq_len, device=x.device)
+            off_idx = offset.to(device=self.cos_cached.device, dtype=torch.int64)
+            if seq_len == 1:
+                pos = off_idx.view(1)
+            else:
+                pos = off_idx + torch.arange(
+                    seq_len, device=self.cos_cached.device, dtype=torch.int64
+                )
+            cos = self.cos_cached.index_select(0, pos).to(dtype=x.dtype)
+            sin = self.sin_cached.index_select(0, pos).to(dtype=x.dtype)
+        else:
+            needed = offset + seq_len
+            if self.cos_cached is None or self.cos_cached.device != x.device:
+                build_len = self.max_seq_len if not isinstance(needed, int) else max(needed, self.max_seq_len)
+                self._build_cache(build_len, device=x.device)
+            elif isinstance(needed, int) and needed > self._seq_len_cached:
+                self._build_cache(max(needed, self.max_seq_len), device=x.device)
 
-        cos = self.cos_cached[offset : offset + seq_len].to(dtype=x.dtype)
-        sin = self.sin_cached[offset : offset + seq_len].to(dtype=x.dtype)
+            cos = self.cos_cached[offset : offset + seq_len].to(dtype=x.dtype)
+            sin = self.sin_cached[offset : offset + seq_len].to(dtype=x.dtype)
 
         while cos.dim() < x.dim():
             cos = cos.unsqueeze(0)
@@ -148,6 +163,49 @@ class RotaryPositionalEmbedding(nn.Module):
         if not self.interleaved:
             return (x * cos) + (_rotate_half(x) * sin)
         return (x * cos) + (_rotate_interleaved(x) * sin)
+
+
+def varlen_kv_append(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    new_k: torch.Tensor,
+    new_v: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sync-free, torch.compile-friendly packed KV cache append (1 token per sequence).
+
+    Replaces `repeat_interleave(seqlens)` + scatter `index_put_` (which forces a GPU->CPU
+    `cudaStreamSynchronize` on every step) with static-output-size `searchsorted` +
+    `index_select` over `[k_cache, new_k]`, allowing TorchInductor to fuse the update.
+    """
+    B = int(cu_seqlens_k.shape[0]) - 1
+    if B <= 0:
+        return k_cache, v_cache, cu_seqlens_k
+
+    device = k_cache.device
+    cu_new = cu_seqlens_k + torch.arange(B + 1, device=device, dtype=cu_seqlens_k.dtype)
+    new_k_cast = new_k.to(dtype=k_cache.dtype)
+    new_v_cast = new_v.to(dtype=v_cache.dtype)
+
+    if B == 1:
+        return (
+            torch.cat([k_cache, new_k_cast], dim=1),
+            torch.cat([v_cache, new_v_cast], dim=1),
+            cu_new,
+        )
+
+    total_old = k_cache.shape[1]
+    total_new = total_old + B
+    cu_new_i64 = cu_new.to(dtype=torch.int64)
+    j = torch.arange(total_new, device=device, dtype=torch.int64)
+    b = torch.searchsorted(cu_new_i64[1:], j, right=True).clamp_max(B - 1)
+    is_new = j == (cu_new_i64[b + 1] - 1)
+    src_idx = torch.where(is_new, total_old + b, j - b)
+
+    k_out = torch.cat([k_cache, new_k_cast], dim=1).index_select(1, src_idx)
+    v_out = torch.cat([v_cache, new_v_cast], dim=1).index_select(1, src_idx)
+    return k_out, v_out, cu_new
 
 
 class VarlenKVCache:
@@ -177,7 +235,7 @@ class VarlenKVCache:
             seqlens = self.cu_seqlens_k[1:] - self.cu_seqlens_k[:-1]
             self.max_seqlen_k = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
         else:
-            self.max_seqlen_k = int(max_seqlen_k)
+            self.max_seqlen_k = max_seqlen_k
 
     @property
     def batch_size(self) -> int:
@@ -203,7 +261,7 @@ class VarlenKVCache:
 
     def append(self, new_k: torch.Tensor, new_v: torch.Tensor) -> None:
         """
-        Append one new decode token per sequence in the batch in a single vectorized step.
+        Append one new decode token per sequence in the batch in a sync-free vectorized step.
 
         Args:
             new_k: (H_kv, B, head_dim) raw unrotated key for the current token
@@ -215,31 +273,13 @@ class VarlenKVCache:
                 f"Expected new_k/new_v shape (H_kv, {B}, D), got {tuple(new_k.shape)} and {tuple(new_v.shape)}"
             )
 
-        H_kv, total_old, head_dim = self.k_cache.shape
-        device = self.k_cache.device
-        cu_old = self.cu_seqlens_k
-
-        cu_new = cu_old + torch.arange(B + 1, device=device, dtype=cu_old.dtype)
-        total_new = total_old + B
-
-        k_out = self.k_cache.new_empty((H_kv, total_new, head_dim))
-        v_out = self.v_cache.new_empty((H_kv, total_new, head_dim))
-
-        if total_old > 0:
-            seqlens_old = (cu_old[1:] - cu_old[:-1]).to(dtype=torch.int64)
-            seq_ids = torch.arange(B, device=device, dtype=torch.int64).repeat_interleave(seqlens_old)
-            old_dst_idx = torch.arange(total_old, device=device, dtype=torch.int64) + seq_ids
-            k_out[:, old_dst_idx, :] = self.k_cache
-            v_out[:, old_dst_idx, :] = self.v_cache
-
-        if B > 0:
-            new_dst_idx = cu_new[1:].to(dtype=torch.int64) - 1
-            k_out[:, new_dst_idx, :] = new_k.to(dtype=self.k_cache.dtype)
-            v_out[:, new_dst_idx, :] = new_v.to(dtype=self.v_cache.dtype)
-
-        self.k_cache = k_out
-        self.v_cache = v_out
-        self.cu_seqlens_k = cu_new
+        self.k_cache, self.v_cache, self.cu_seqlens_k = varlen_kv_append(
+            self.k_cache,
+            self.v_cache,
+            self.cu_seqlens_k,
+            new_k,
+            new_v,
+        )
         if B > 0:
             self.max_seqlen_k += 1
 
@@ -602,7 +642,7 @@ class VarlenFlashGQA(_BaseFlashGQA):
         seq_hint = None
         if offsets is None and max_seqlen_q is not None:
             eff_max_k = max_seqlen_k if max_seqlen_k is not None else max_seqlen_q
-            seq_hint = max(int(max_seqlen_q), int(eff_max_k))
+            seq_hint = max(max_seqlen_q, eff_max_k)
         cos, sin = self._resolve_rope_tables(seq_hint, x.device, x.dtype)
 
         attn_out = varlen_flash_attention(
@@ -727,7 +767,7 @@ class BatchedFlashGQABaselineSpeed(_BaseFlashGQA):
         context: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
-        offset: int = 0,
+        offset: Union[int, torch.Tensor] = 0,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
@@ -888,6 +928,7 @@ class FlashGQA(_BaseFlashGQA):
 __all__ = [
     "RotaryPositionalEmbedding",
     "VarlenKVCache",
+    "varlen_kv_append",
     "varlen_attention_ref",
     "varlen_decode_ref",
     "VarlenFlashGQA",
