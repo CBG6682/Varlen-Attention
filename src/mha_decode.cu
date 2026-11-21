@@ -688,7 +688,6 @@ at::Tensor fused_mha_varlen_decode(
     constexpr int TILE_K_TOKENS = 16;
     constexpr int SPLIT_TILE = 8;
     constexpr int64_t SPLIT_MIN_LEN = 64;
-    constexpr int64_t SHORT_KV_LEN_THRESH = 256;
     constexpr int smem_size_splitk =
         (TILE_K_TOKENS * HEAD_DIM + 2 * TILE_K_TOKENS) * static_cast<int>(sizeof(float));
 
@@ -717,9 +716,14 @@ at::Tensor fused_mha_varlen_decode(
     const int64_t max_possible_splits =
         std::max<int64_t>(1, (max_seqlen_k + SPLIT_MIN_LEN - 1) / SPLIT_MIN_LEN);
 
+    // Pure B * H_q occupancy-based dispatch (no sequence-length threshold):
+    // - When B * H_q is large enough to saturate GPU occupancy (target_splits < 2),
+    //   use Direct 1-Block FP16 (no intermediate workspace, no reduction kernel).
+    // - When B * H_q is small (target_splits >= 2) and KV has >= 2 split chunks,
+    //   use Split-K Flash Decoding to fill idle SMs.
     const bool run_splitk = use_splitk.has_value()
         ? use_splitk.value()
-        : ((target_splits >= 2) && (max_possible_splits >= 2) && (max_seqlen_k > SHORT_KV_LEN_THRESH));
+        : ((target_splits >= 2) && (max_possible_splits >= 2));
 
     const int num_splits = run_splitk
         ? static_cast<int>(std::clamp<int64_t>(target_splits, 1, max_possible_splits))

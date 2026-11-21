@@ -32,6 +32,7 @@ from tests.utils import (
     build_padding_mask,
     compute_decode_bandwidth_gbps,
     cuda_benchmark,
+    fa1_unpadded_func,
     format_markdown_table,
     generate_varlen_seqlens,
     measure_peak_memory_mb,
@@ -56,13 +57,52 @@ def _repeat_kv_batched(x: torch.Tensor, rep: int) -> torch.Tensor:
     return x.unsqueeze(2).expand(B, H_kv, rep, L, D).reshape(B, H_kv * rep, L, D)
 
 
-def _compile_or_warn(target: Any, label: str):
+def _repeat_kv_packed(x: torch.Tensor, rep: int) -> torch.Tensor:
+    """Convert `(H_kv, Total_L, D)` -> `(Total_L, H_q, D)` for FlashAttention-1."""
+    H_kv, total_l, D = x.shape
+    x_lh = x.transpose(0, 1).contiguous()
+    if rep == 1:
+        return x_lh
+    return x_lh.unsqueeze(2).expand(total_l, H_kv, rep, D).reshape(total_l, H_kv * rep, D)
+
+
+def _compile_or_warn(target: Any, label: str, dynamic: bool = True):
     """Compile target with TorchInductor; return None on failure."""
     try:
-        return torch.compile(target, backend="inductor", dynamic=True)
+        return torch.compile(target, backend="inductor", dynamic=dynamic)
     except Exception as exc:
         print(f"[WARN] Could not torch.compile({label}): {exc}")
         return None
+
+
+def _verify_efficient_attention_active(
+    batch_size: int,
+    num_heads_q: int,
+    aligned_len: int,
+    head_dim: int,
+    scale: float,
+    device: torch.device,
+) -> bool:
+    """Verify that `SDPBackend.EFFICIENT_ATTENTION` is active for Part A FP16 additive mask."""
+    q_chk = torch.randn((batch_size, num_heads_q, 1, head_dim), device=device, dtype=torch.float16)
+    k_chk = torch.randn((batch_size, num_heads_q, aligned_len, head_dim), device=device, dtype=torch.float16)
+    v_chk = torch.randn_like(k_chk)
+    cu_chk = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * aligned_len
+    mask_chk, _ = build_additive_padding_mask(
+        cu_chk, aligned_len, num_heads_q=num_heads_q, seqlen_q=1, dtype=torch.float16, align_to=8
+    )
+    try:
+        choice = None
+        if hasattr(torch.ops.aten, "_fused_sdp_choice"):
+            choice = int(torch.ops.aten._fused_sdp_choice(q_chk, k_chk, v_chk, attn_mask=mask_chk, scale=scale))
+        if _HAS_SDPA_KERNEL:
+            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                _ = F.scaled_dot_product_attention(q_chk, k_chk, v_chk, attn_mask=mask_chk, scale=scale)
+        print(f"[INFO] Part A SDPA Backend verified: SDPBackend.EFFICIENT_ATTENTION (choice={choice})")
+        return True
+    except Exception as exc:
+        print(f"[WARN] SDPBackend.EFFICIENT_ATTENTION verification failed: {exc}")
+        return False
 
 
 def _save_inference_plot(
@@ -96,21 +136,33 @@ def _save_inference_plot(
         for r in skewed_rows
     )
 
+    has_fa1_dec = all(r.get("fa1_dec_ms") is not None for r in skewed_rows)
     if has_comp_dec:
-        w = 0.21
         t_base = [r["batched_comp_ms"] for r in skewed_rows]
         t_dir = [r.get("varlen_direct_comp_ms") or r["varlen_direct_eager_ms"] for r in skewed_rows]
         t_spk = [r.get("varlen_splitk_comp_ms") or r["varlen_splitk_eager_ms"] for r in skewed_rows]
         t_auto = [r["varlen_comp_ms"] for r in skewed_rows]
-        ax1.bar([i - 1.5 * w for i in x_idx], t_base, w, label="Batched SDPA + Compile (Base)", color="#e63946")
-        ax1.bar([i - 0.5 * w for i in x_idx], t_dir, w, label="Direct 1-Block Decode", color="#457b9d")
-        ax1.bar([i + 0.5 * w for i in x_idx], t_spk, w, label="Split-K Flash Decode", color="#e9c46a")
-        ax1.bar([i + 1.5 * w for i in x_idx], t_auto, w, label="Auto-Dispatch (Ours)", color="#2a9d8f")
+        if has_fa1_dec:
+            w = 0.165
+            t_fa1 = [r["fa1_dec_ms"] for r in skewed_rows]
+            ax1.bar([i - 2.0 * w for i in x_idx], t_base, w, label="Batched SDPA + Compile (Base)", color="#e63946")
+            ax1.bar([i - 1.0 * w for i in x_idx], t_fa1, w, label="FlashAttention-1 (Varlen)", color="#8ecae6")
+            ax1.bar(x_idx, t_dir, w, label="Direct 1-Block Decode", color="#457b9d")
+            ax1.bar([i + 1.0 * w for i in x_idx], t_spk, w, label="Split-K Flash Decode", color="#e9c46a")
+            ax1.bar([i + 2.0 * w for i in x_idx], t_auto, w, label="Auto-Dispatch (Ours)", color="#2a9d8f")
+            auto_x_off = 2.0 * w
+        else:
+            w = 0.21
+            ax1.bar([i - 1.5 * w for i in x_idx], t_base, w, label="Batched SDPA + Compile (Base)", color="#e63946")
+            ax1.bar([i - 0.5 * w for i in x_idx], t_dir, w, label="Direct 1-Block Decode", color="#457b9d")
+            ax1.bar([i + 0.5 * w for i in x_idx], t_spk, w, label="Split-K Flash Decode", color="#e9c46a")
+            ax1.bar([i + 1.5 * w for i in x_idx], t_auto, w, label="Auto-Dispatch (Ours)", color="#2a9d8f")
+            auto_x_off = 1.5 * w
         for i, r in enumerate(skewed_rows):
             sp = r.get("speedup_comp", 1.0)
             ax1.annotate(
                 f"{sp:.2f}x",
-                xy=(i + 1.5 * w, t_auto[i]),
+                xy=(i + auto_x_off, t_auto[i]),
                 xytext=(0, 3),
                 textcoords="offset points",
                 ha="center",
@@ -311,9 +363,19 @@ def run_inference_benchmark(
     print("\n" + "=" * 95)
     print(" PART A: Microbenchmark Decode Attention L_q=1 (Cold L2 - Speed & Bandwidth Only)")
     print(f" Config: H_q={num_heads_q}, H_kv={num_heads_kv}, D={head_dim}, rope={use_rope}, clear_l2={clear_l2}")
-    print(f" Baseline Speed: Batched SDPA Decode + torch.compile(backend='inductor', dynamic=True)")
-    print(f" Custom Kernel:  Direct 1-Block vs Split-K vs Adaptive Auto-Dispatch (+ torch.compile)")
+    print(" Baseline #1 Speed: Batched SDPA (SDPBackend.EFFICIENT_ATTENTION) + torch.compile(dynamic=False)")
+    print(f" Baseline #2 Speed: FlashAttention-1 ({'Enabled' if HAS_FLASH_ATTN_1 else 'Not installed'})")
+    print(" Custom Kernel:     Direct 1-Block vs Split-K vs Adaptive Auto-Dispatch (+ torch.compile)")
     print("=" * 95)
+
+    eff_attn_ok = _verify_efficient_attention_active(
+        batch_size=min(decode_batch_sizes) if decode_batch_sizes else 1,
+        num_heads_q=num_heads_q,
+        aligned_len=128,
+        head_dim=head_dim,
+        scale=scale,
+        device=dev,
+    )
 
     compiled_varlen_auto = None
     compiled_varlen_direct = None
@@ -339,15 +401,11 @@ def run_inference_benchmark(
 
         compiled_varlen_splitk = _compile_or_warn(_c_varlen_splitk, "varlen_flash_decode_splitk")
 
-        def _c_batched_dec(q_b, k_b, v_b, pad_m, sc_val, rep_val):
-            k_exp = _repeat_kv_batched(k_b, rep_val)
-            v_exp = _repeat_kv_batched(v_b, rep_val)
-            if _HAS_SDPA_KERNEL:
-                with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-                    return F.scaled_dot_product_attention(q_b, k_exp, v_exp, attn_mask=pad_m, scale=sc_val)
+        def _c_batched_dec(q_b, k_exp, v_exp, pad_m, sc_val):
             return F.scaled_dot_product_attention(q_b, k_exp, v_exp, attn_mask=pad_m, scale=sc_val)
 
-        compiled_batched_dec = _compile_or_warn(_c_batched_dec, "batched_sdpa_decode")
+        # Static shape compilation so Inductor proves pad_m.size(-1) % 8 == 0 and uses EFFICIENT_ATTENTION
+        compiled_batched_dec = _compile_or_warn(_c_batched_dec, "batched_sdpa_decode", dynamic=False)
 
     decode_results: List[Dict[str, Any]] = []
     decode_rows: List[List[str]] = []
@@ -364,19 +422,37 @@ def run_inference_benchmark(
                 try:
                     # 1. Batched SDPA Decode Baseline (FP16 additive mask + L%8 aligned for EFFICIENT_ATTENTION)
                     pad_mask, aligned_max = build_additive_padding_mask(
-                        cu_seqlens, actual_max, dtype=torch.float16, align_to=8
+                        cu_seqlens,
+                        actual_max,
+                        num_heads_q=num_heads_q,
+                        seqlen_q=1,
+                        dtype=torch.float16,
+                        align_to=8,
                     )
                     q_batched = torch.randn((B, num_heads_q, 1, head_dim), device=dev, dtype=torch.float16)
                     k_batched = torch.randn((B, num_heads_kv, aligned_max, head_dim), device=dev, dtype=torch.float16)
                     v_batched = torch.randn((B, num_heads_kv, aligned_max, head_dim), device=dev, dtype=torch.float16)
                     q_batched_roped = rope(q_batched, offset=actual_max - 1) if rope is not None else q_batched
+                    k_batched_exp = _repeat_kv_batched(k_batched, rep_gqa)
+                    v_batched_exp = _repeat_kv_batched(v_batched, rep_gqa)
+
+                    sdp_backends = (
+                        SDPBackend.EFFICIENT_ATTENTION
+                        if eff_attn_ok
+                        else [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+                    )
 
                     b_comp_ms: Optional[float] = None
                     if compiled_batched_dec is not None:
                         def _batched_dec_comp_fn():
                             with torch.no_grad():
+                                if _HAS_SDPA_KERNEL:
+                                    with sdpa_kernel(sdp_backends):
+                                        return compiled_batched_dec(
+                                            q_batched_roped, k_batched_exp, v_batched_exp, pad_mask, scale
+                                        )
                                 return compiled_batched_dec(
-                                    q_batched_roped, k_batched, v_batched, pad_mask, scale, rep_gqa
+                                    q_batched_roped, k_batched_exp, v_batched_exp, pad_mask, scale
                                 )
 
                         b_comp_ms, _, _ = cuda_benchmark(
@@ -385,22 +461,20 @@ def run_inference_benchmark(
 
                     def _batched_dec_eager_fn():
                         with torch.no_grad():
-                            k_exp = _repeat_kv_batched(k_batched, rep_gqa)
-                            v_exp = _repeat_kv_batched(v_batched, rep_gqa)
                             if _HAS_SDPA_KERNEL:
-                                with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                                with sdpa_kernel(sdp_backends):
                                     return F.scaled_dot_product_attention(
-                                        q_batched_roped, k_exp, v_exp, attn_mask=pad_mask, scale=scale
+                                        q_batched_roped, k_batched_exp, v_batched_exp, attn_mask=pad_mask, scale=scale
                                     )
                             return F.scaled_dot_product_attention(
-                                q_batched_roped, k_exp, v_exp, attn_mask=pad_mask, scale=scale
+                                q_batched_roped, k_batched_exp, v_batched_exp, attn_mask=pad_mask, scale=scale
                             )
 
                     b_eager_ms, _, _ = cuda_benchmark(
                         _batched_dec_eager_fn, warmup=warmup, rep=rep, clear_l2=clear_l2
                     )
 
-                    del q_batched, q_batched_roped, k_batched, v_batched, pad_mask
+                    del q_batched, q_batched_roped, k_batched, v_batched, k_batched_exp, v_batched_exp, pad_mask
                     gc.collect()
                     torch.cuda.empty_cache()
 
@@ -488,6 +562,37 @@ def run_inference_benchmark(
                         _varlen_auto_eager_fn, warmup=warmup, rep=rep, clear_l2=clear_l2
                     )
 
+                    # 3. FlashAttention-1 Decode L_q=1 Baseline (if installed)
+                    fa1_dec_ms: Optional[float] = None
+                    if HAS_FLASH_ATTN_1 and fa1_unpadded_func is not None:
+                        try:
+                            q_fa1 = q_dec.transpose(0, 1).contiguous()  # (B, H_q, D)
+                            k_fa1 = _repeat_kv_packed(k_packed, rep_gqa)  # (Total_Lk, H_q, D)
+                            v_fa1 = _repeat_kv_packed(v_packed, rep_gqa)
+                            cu_q_fa1 = torch.arange(B + 1, device=dev, dtype=torch.int32)
+
+                            def _fa1_dec_fn():
+                                with torch.no_grad():
+                                    return fa1_unpadded_func(
+                                        q_fa1,
+                                        k_fa1,
+                                        v_fa1,
+                                        cu_q_fa1,
+                                        cu_seqlens,
+                                        1,
+                                        actual_max,
+                                        0.0,
+                                        softmax_scale=scale,
+                                        causal=False,
+                                    )
+
+                            fa1_dec_ms, _, _ = cuda_benchmark(
+                                _fa1_dec_fn, warmup=warmup, rep=rep, clear_l2=clear_l2
+                            )
+                            del q_fa1, k_fa1, v_fa1, cu_q_fa1
+                        except Exception as exc:
+                            print(f"[WARN] FA1 Part A decode skipped for B={B}, MaxK={actual_max}: {exc}")
+
                     del q_dec, k_packed, v_packed
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -520,6 +625,7 @@ def run_inference_benchmark(
                         "max_len": actual_max,
                         "total_lk": total_lk,
                         "batched_comp_ms": b_comp_ms,
+                        "fa1_dec_ms": fa1_dec_ms,
                         "varlen_direct_comp_ms": v_direct_comp_ms,
                         "varlen_splitk_comp_ms": v_splitk_comp_ms,
                         "varlen_comp_ms": v_auto_comp_ms,
@@ -540,41 +646,40 @@ def run_inference_benchmark(
                 v_auto_str = f"{v_auto_comp_ms:.3f}" if v_auto_comp_ms is not None else f"{v_eager_ms:.3f}"
                 sp_comp_str = f"{speedup_comp:.2f}x" if speedup_comp is not None else f"{speedup_eager:.2f}x"
 
-                decode_rows.append(
-                    [
-                        dist,
-                        str(B),
-                        str(actual_max),
-                        str(total_lk),
-                        b_comp_str,
-                        v_dir_str,
-                        v_spk_str,
-                        v_auto_str,
-                        sp_comp_str,
-                        f"{bw_gbps:.1f}",
-                        f"{tok_per_s:,.0f}",
-                    ]
-                )
+                row_dec = [
+                    dist,
+                    str(B),
+                    str(actual_max),
+                    str(total_lk),
+                    b_comp_str,
+                    v_dir_str,
+                    v_spk_str,
+                    v_auto_str,
+                    sp_comp_str,
+                    f"{bw_gbps:.1f}",
+                    f"{tok_per_s:,.0f}",
+                ]
+                if HAS_FLASH_ATTN_1:
+                    row_dec.insert(5, f"{fa1_dec_ms:.3f}" if fa1_dec_ms is not None else "N/A")
+                decode_rows.append(row_dec)
 
-    print(
-        "\n"
-        + format_markdown_table(
-            [
-                "Dist",
-                "B",
-                "MaxK",
-                "TotalLk",
-                "Batched+Comp(ms) [Base]",
-                "Direct 1-Blk(ms)",
-                "Split-K(ms)",
-                "Auto+Comp(ms) [Ours]",
-                "Comp Spd",
-                "BW (GB/s)",
-                "Tok/s",
-            ],
-            decode_rows,
-        )
-    )
+    decode_headers = [
+        "Dist",
+        "B",
+        "MaxK",
+        "TotalLk",
+        "Batched+Comp(ms) [Base]",
+        "Direct 1-Blk(ms)",
+        "Split-K(ms)",
+        "Auto+Comp(ms) [Ours]",
+        "Comp Spd",
+        "BW (GB/s)",
+        "Tok/s",
+    ]
+    if HAS_FLASH_ATTN_1:
+        decode_headers.insert(5, "FA1(ms)")
+
+    print("\n" + format_markdown_table(decode_headers, decode_rows))
 
     # =========================================================================
     # PART B: End-to-End Prefill (TTFT) + Generation (TPOT) + E2E Peak VRAM
@@ -583,7 +688,7 @@ def run_inference_benchmark(
     print("\n" + "=" * 95)
     print(f" PART B: End-to-End Prefill + {gen_steps}-Step Generation + Peak VRAM Benchmark")
     print(f" Config: H_q={num_heads_q}, H_kv={num_heads_kv}, embed_dim={embed_dim} (high SM & VRAM utilization)")
-    print(f" Comparing separately: Baseline (Batched SDPA) vs Direct 1-Block (Thuong) vs Split-K Flash Decoding")
+    print(" Comparing separately: Baseline (Batched SDPA) vs Direct 1-Block vs Split-K Flash Decoding")
     print("=" * 95)
 
     mod_varlen = VarlenFlashGQA(embed_dim, num_heads_q, num_heads_kv, rope=rope, bias=False).to(
@@ -731,8 +836,13 @@ def run_inference_benchmark(
             total_kv_cap_aligned = align_up(total_kv_cap, 8)
             pos_dec = torch.arange(total_kv_cap_aligned, device=dev, dtype=torch.int32).unsqueeze(0)
             valid_dec = (pos_dec < seqlens.unsqueeze(1)) | (pos_dec >= actual_max)
-            full_dec_mask = torch.zeros((B, 1, 1, total_kv_cap_aligned), device=dev, dtype=torch.float16)
-            full_dec_mask.masked_fill_(~valid_dec.unsqueeze(1).unsqueeze(1), float("-inf"))
+            base_dec_mask = torch.zeros((B, total_kv_cap_aligned), device=dev, dtype=torch.float16)
+            base_dec_mask.masked_fill_(~valid_dec, float("-inf"))
+            full_dec_mask = torch.as_strided(
+                base_dec_mask,
+                size=(B, num_heads_q, 1, total_kv_cap_aligned),
+                stride=(total_kv_cap_aligned, 0, 0, 1),
+            )
             step_masks = [full_dec_mask[:, :, :, : actual_max + step + 1] for step in range(gen_steps)]
             offset_tensors = [
                 torch.tensor(actual_max + step, device=dev, dtype=torch.int64) for step in range(gen_steps)

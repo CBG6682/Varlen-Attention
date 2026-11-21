@@ -20,6 +20,8 @@ except ImportError:
         _fa1_unpadded_func = None
         HAS_FLASH_ATTN_1 = False
 
+fa1_unpadded_func = _fa1_unpadded_func
+
 
 def seed_everything(seed: int = 42) -> None:
     """Set deterministic RNG seeds for Python and PyTorch (CPU + CUDA)."""
@@ -168,21 +170,30 @@ def align_up(value: int, alignment: int = 8) -> int:
 def build_additive_padding_mask(
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
+    num_heads_q: int = 1,
+    seqlen_q: int = 1,
     dtype: torch.dtype = torch.float16,
     align_to: int = 8,
 ) -> Tuple[torch.Tensor, int]:
     """
-    Build FP16 additive padding mask `(B, 1, 1, aligned_len)` (0.0 = valid, -inf = masked)
-    with last dimension aligned to a multiple of `align_to` (8 for 16B / Efficient Attention).
+    Build FP16 additive padding mask `(B, num_heads_q, seqlen_q, aligned_len)`
+    (0.0 = valid, -inf = masked) with last dimension aligned to `align_to` (8)
+    and explicit strides `(aligned_len, 0, 0, 1)` so all strides satisfy CUTLASS
+    `SDPBackend.EFFICIENT_ATTENTION` 16-byte alignment checks even when B=1 or L_q=1.
     """
     aligned_len = max(align_to, align_up(max_seqlen, align_to))
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
     B = int(seqlens.shape[0])
     positions = torch.arange(aligned_len, device=cu_seqlens.device, dtype=seqlens.dtype)
     valid = positions.unsqueeze(0) < seqlens.unsqueeze(1)  # (B, aligned_len)
-    mask = torch.zeros((B, 1, 1, aligned_len), device=cu_seqlens.device, dtype=dtype)
-    mask.masked_fill_(~valid.unsqueeze(1).unsqueeze(1), float("-inf"))
-    return mask.contiguous(), aligned_len
+    base_mask = torch.zeros((B, aligned_len), device=cu_seqlens.device, dtype=dtype)
+    base_mask.masked_fill_(~valid, float("-inf"))
+    mask = torch.as_strided(
+        base_mask,
+        size=(B, num_heads_q, seqlen_q, aligned_len),
+        stride=(aligned_len, 0, 0, 1),
+    )
+    return mask, aligned_len
 
 
 def cuda_benchmark(
@@ -447,6 +458,7 @@ __all__ = [
     "build_additive_padding_mask",
     "build_packed_rope_positions",
     "HAS_FLASH_ATTN_1",
+    "fa1_unpadded_func",
     "FlashAttention1VarlenBaseline",
     "cuda_benchmark",
     "measure_peak_memory_mb",
