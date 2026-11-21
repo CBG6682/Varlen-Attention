@@ -13,9 +13,6 @@ if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
 from tests.utils import (
-    HAS_FLASH_ATTN_1,
-    FlashAttention1VarlenBaseline,
-    build_packed_rope_positions,
     build_padding_mask,
     compute_attention_flops,
     compute_tflops,
@@ -67,54 +64,34 @@ def _save_training_plot(results: List[Dict[str, Any]], save_path: str) -> None:
         r.get("batched_comp_fwdbwd_ms") is not None and r.get("varlen_comp_fwdbwd_ms") is not None
         for r in skewed_rows
     )
-    has_fa1 = all(r.get("fa1_fwdbwd_ms") is not None for r in skewed_rows)
-
     if has_comp:
         t_base_comp = [r["batched_comp_fwdbwd_ms"] for r in skewed_rows]
         t_var_comp = [r["varlen_comp_fwdbwd_ms"] for r in skewed_rows]
-        if has_fa1:
-            w3 = 0.26
-            t_fa1 = [r["fa1_fwdbwd_ms"] for r in skewed_rows]
-            ax1.bar([i - w3 for i in x_idx], t_base_comp, w3, label="Batched SDPA + torch.compile (Base)", color="#e63946")
-            ax1.bar(x_idx, t_fa1, w3, label="FlashAttention-1 (Varlen)", color="#457b9d")
-            ax1.bar([i + w3 for i in x_idx], t_var_comp, w3, label="Varlen CUDA + torch.compile (Ours)", color="#2a9d8f")
-            for i, r in enumerate(skewed_rows):
-                sp = r.get("speedup_comp_fwdbwd", 1.0)
-                ax1.annotate(
-                    f"{sp:.2f}x",
-                    xy=(i + w3, t_var_comp[i]),
-                    xytext=(0, 4),
-                    textcoords="offset points",
-                    ha="center",
-                    fontsize=8,
-                    fontweight="bold",
-                )
-        else:
-            ax1.bar(
-                [i - width / 2 for i in x_idx],
-                t_base_comp,
-                width,
-                label="Batched SDPA + torch.compile (Baseline)",
-                color="#e63946",
+        ax1.bar(
+            [i - width / 2 for i in x_idx],
+            t_base_comp,
+            width,
+            label="Batched SDPA + torch.compile (Baseline)",
+            color="#e63946",
+        )
+        ax1.bar(
+            [i + width / 2 for i in x_idx],
+            t_var_comp,
+            width,
+            label="Varlen CUDA + torch.compile (Ours)",
+            color="#2a9d8f",
+        )
+        for i, r in enumerate(skewed_rows):
+            sp = r.get("speedup_comp_fwdbwd", 1.0)
+            ax1.annotate(
+                f"{sp:.2f}x",
+                xy=(i + width / 2, t_var_comp[i]),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+                fontweight="bold",
             )
-            ax1.bar(
-                [i + width / 2 for i in x_idx],
-                t_var_comp,
-                width,
-                label="Varlen CUDA + torch.compile (Ours)",
-                color="#2a9d8f",
-            )
-            for i, r in enumerate(skewed_rows):
-                sp = r.get("speedup_comp_fwdbwd", 1.0)
-                ax1.annotate(
-                    f"{sp:.2f}x",
-                    xy=(i + width / 2, t_var_comp[i]),
-                    xytext=(0, 4),
-                    textcoords="offset points",
-                    ha="center",
-                    fontsize=8,
-                    fontweight="bold",
-                )
         ax1.set_title("Training Fwd+Bwd Latency vs torch.compile Baseline (Lower is Better)")
     else:
         t_base_eager = [r["batched_fwdbwd_ms"] for r in skewed_rows]
@@ -211,13 +188,6 @@ def run_training_benchmark(
     )
     mod_batched.load_state_dict(mod_varlen.state_dict())
 
-    mod_fa1 = None
-    if HAS_FLASH_ATTN_1:
-        mod_fa1 = FlashAttention1VarlenBaseline(
-            embed_dim, num_heads_q, num_heads_kv, rope=rope, bias=False
-        ).to(device=dev, dtype=torch.float16)
-        mod_fa1.load_state_dict(mod_varlen.state_dict())
-
     mod_vref = None
     if include_varlen_ref:
         mod_vref = VarlenFlashGQABaselineCorrectness(
@@ -238,7 +208,6 @@ def run_training_benchmark(
     print(f" Config: H_q={num_heads_q}, H_kv={num_heads_kv}, D={head_dim}, causal={is_causal}, rope={use_rope}")
     print(f" Primary Baseline: BatchedFlashGQABaselineSpeed + torch.compile(backend='inductor', dynamic=True)")
     print(f" Custom Kernel:    VarlenFlashGQA + torch.compile(backend='inductor', dynamic=True)")
-    print(f" FlashAttn-1:      {'Enabled (flash_attn_unpadded_func)' if HAS_FLASH_ATTN_1 else 'Not installed (skipped)'}")
     print("=" * 90)
 
     for dist in distributions:
@@ -408,46 +377,6 @@ def run_training_benchmark(
                     torch.cuda.empty_cache()
                     _, v_vram_mb = measure_peak_memory_mb(_varlen_eager_fwdbwd)
 
-                # =============================================================
-                # PHASE 3: FlashAttention-1 Baseline & Optional Python Ref
-                # =============================================================
-                fa1_fwd_ms: Optional[float] = None
-                fa1_fwdbwd_ms: Optional[float] = None
-                if mod_fa1 is not None:
-                    mod_varlen.zero_grad(set_to_none=True)
-                    x_packed.grad = None
-                    fa1_pos_ids = build_packed_rope_positions(cu_seqlens) if use_rope else None
-
-                    def _fa1_fwd():
-                        with torch.no_grad():
-                            return mod_fa1(
-                                x_packed,
-                                cu_seqlens_q=cu_seqlens,
-                                max_seqlen_q=actual_max,
-                                max_seqlen_k=actual_max,
-                                is_causal=is_causal,
-                                pos_ids=fa1_pos_ids,
-                            )
-
-                    def _fa1_fwdbwd():
-                        mod_fa1.zero_grad(set_to_none=True)
-                        x_packed.grad = None
-                        out = mod_fa1(
-                            x_packed,
-                            cu_seqlens_q=cu_seqlens,
-                            max_seqlen_q=actual_max,
-                            max_seqlen_k=actual_max,
-                            is_causal=is_causal,
-                            pos_ids=fa1_pos_ids,
-                        )
-                        out.backward(go_packed)
-                        return out
-
-                    fa1_fwd_ms, _, _ = cuda_benchmark(_fa1_fwd, warmup=warmup, rep=rep)
-                    fa1_fwdbwd_ms, _, _ = cuda_benchmark(_fa1_fwdbwd, warmup=warmup, rep=rep)
-                    mod_fa1.zero_grad(set_to_none=True)
-                    del fa1_pos_ids
-
                 vref_fwdbwd_ms: Optional[float] = None
                 if mod_vref is not None and actual_max <= 1024:
                     def _vref_fwdbwd():
@@ -508,8 +437,6 @@ def run_training_benchmark(
                     "varlen_fwdbwd_ms": v_eager_fwdbwd_ms,
                     "speedup_eager_fwdbwd": speedup_eager_fwdbwd,
                     "inductor_gain": inductor_gain,
-                    "fa1_fwd_ms": fa1_fwd_ms,
-                    "fa1_fwdbwd_ms": fa1_fwdbwd_ms,
                     "vref_fwdbwd_ms": vref_fwdbwd_ms,
                     "tflops_fwd": tflops_fwd,
                     "tflops_fwdbwd": tflops_fwdbwd,
@@ -537,8 +464,6 @@ def run_training_benchmark(
                     f"{tflops_fwdbwd:.2f}",
                     f"{v_vram_mb:.1f} / {b_vram_mb:.1f}",
                 ]
-                if HAS_FLASH_ATTN_1:
-                    fwdbwd_row.insert(6, f"{fa1_fwdbwd_ms:.3f}" if fa1_fwdbwd_ms is not None else "N/A")
                 table_rows.append(fwdbwd_row)
 
                 comp_fwd_sp_str = f"{speedup_comp_fwd:.2f}x" if speedup_comp_fwd is not None else "N/A"
@@ -563,8 +488,6 @@ def run_training_benchmark(
                     f"{fwd_ind_gain:.2f}x",
                     f"{tflops_fwd:.2f}",
                 ]
-                if HAS_FLASH_ATTN_1:
-                    fwd_row.insert(6, f"{fa1_fwd_ms:.3f}" if fa1_fwd_ms is not None else "N/A")
                 fwd_rows.append(fwd_row)
 
                 mod_varlen.zero_grad(set_to_none=True)
@@ -601,10 +524,6 @@ def run_training_benchmark(
         "Inductor Gain",
         "Fwd TFLOP/s",
     ]
-
-    if HAS_FLASH_ATTN_1:
-        headers_fwdbwd.insert(6, "FA1(ms)")
-        headers_fwd.insert(6, "FA1 Fwd(ms)")
 
     print("\n### Training Forward + Backward (Speed & Peak VRAM)\n" + format_markdown_table(headers_fwdbwd, table_rows))
     print("\n### Training Forward-Only (Speed & TFLOP/s)\n" + format_markdown_table(headers_fwd, fwd_rows))
