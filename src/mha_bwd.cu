@@ -1,4 +1,4 @@
-// Kernel CUDA/CuTe tính Backward FlashAttention + Fused RoPE biến thiên độ dài (Varlen) cho kiến trúc SM75 (Turing)
+// Varlen FlashAttention + Fused RoPE Backward CUDA/CuTe kernel for SM75 (Turing)
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -26,8 +26,92 @@
 using namespace cute;
 
 // =================================================================================================
-// PHẦN 1: DEVICE KERNEL (__global__) VÀ HELPERS
+// 1. Device Kernel & Helpers
 // =================================================================================================
+
+// Apply forward RoPE in registers (32x8 thread layout, 8 half elements per step).
+template <int TILE_K, typename FragFP16>
+__device__ __forceinline__ void apply_rope_fwd_32x8(
+    FragFP16& rTile,                              // ((1,8), 2, 1) [FP16] - register tile to rotate
+    const cutlass::half_t* __restrict__ cos_ptr,  // (L_max, 64) [FP16] - RoPE cos table
+    const cutlass::half_t* __restrict__ sin_ptr,  // (L_max, 64) [FP16] - RoPE sin table
+    int tile_start_pos,                           // scalar [int] - sequence start position of tile
+    int offset,                                   // scalar [int] - sequence RoPE offset
+    int valid_rows,                               // scalar [int] - remaining valid rows in sequence
+    int row_m0_g2r,                               // scalar [int] - row index for step m=0
+    int row_m1_g2r,                               // scalar [int] - row index for step m=1
+    int col_vec_g2r,                              // scalar [int] - 8-column vector group index (0..7)
+    bool is_second_half_g2r                       // scalar [bool] - true for upper columns [32..63]
+) {
+    CUTE_UNROLL
+    for (int m = 0; m < size<1>(rTile); ++m) {
+        const int row_in_tile = (m == 0) ? row_m0_g2r : row_m1_g2r;
+        const bool valid_row = (row_in_tile < valid_rows);
+        const int rope_pos = valid_row ? (offset + tile_start_pos + row_in_tile) : 0;
+        const __half2* cos_h2 = reinterpret_cast<const __half2*>(
+            cos_ptr + rope_pos * TILE_K + col_vec_g2r * 8);
+        const __half2* sin_h2 = reinterpret_cast<const __half2*>(
+            sin_ptr + rope_pos * TILE_K + col_vec_g2r * 8);
+        apply_rope_fwd_8elem_shfl(&rTile(0, m, 0), cos_h2, sin_h2, is_second_half_g2r);
+        if (!valid_row) {
+            clear(rTile(_, m, 0));
+        }
+    }
+}
+
+// Apply backward RoPE in-place on FP32 register fragment (16x16 thread layout, 4 floats per step).
+template <int TILE_K, typename FragF32>
+__device__ __forceinline__ void apply_rope_bwd_f32_16x16(
+    FragF32& rF32,                                // ((1,4), 4, 1) [FP32] - gradient before RoPE (in-place)
+    const cutlass::half_t* __restrict__ cos_ptr,  // (L_max, 64) [FP16] - RoPE cos table
+    const cutlass::half_t* __restrict__ sin_ptr,  // (L_max, 64) [FP16] - RoPE sin table
+    int tile_start_pos,                           // scalar [int] - sequence start position of tile
+    int offset,                                   // scalar [int] - sequence RoPE offset
+    int valid_rows,                               // scalar [int] - remaining valid rows in sequence
+    int row_in_step_f32,                          // scalar [int] - row within 16-row group (tid >> 4)
+    int col_vec_f32,                              // scalar [int] - 4-column group index (tid & 15)
+    bool is_second_half_f32                       // scalar [bool] - true for upper columns [32..63]
+) {
+    CUTE_UNROLL
+    for (int m = 0; m < size<1>(rF32); ++m) {
+        const int row_in_tile = m * 16 + row_in_step_f32;
+        const bool valid_row = (row_in_tile < valid_rows);
+        const int rope_pos = valid_row ? (offset + tile_start_pos + row_in_tile) : 0;
+        const __half2* cos_h2 = reinterpret_cast<const __half2*>(
+            cos_ptr + rope_pos * TILE_K + col_vec_f32 * 4);
+        const __half2* sin_h2 = reinterpret_cast<const __half2*>(
+            sin_ptr + rope_pos * TILE_K + col_vec_f32 * 4);
+
+        float c_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float s_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (valid_row) {
+            const __half2 c01 = cos_h2[0];
+            const __half2 c23 = cos_h2[1];
+            const __half2 s01 = sin_h2[0];
+            const __half2 s23 = sin_h2[1];
+            c_arr[0] = __low2float(c01);
+            c_arr[1] = __high2float(c01);
+            c_arr[2] = __low2float(c23);
+            c_arr[3] = __high2float(c23);
+            s_arr[0] = __low2float(s01);
+            s_arr[1] = __high2float(s01);
+            s_arr[2] = __low2float(s23);
+            s_arr[3] = __high2float(s23);
+        }
+
+        // All warp lanes must execute __shfl_xor_sync unconditionally before valid_row guard.
+        CUTE_UNROLL
+        for (int v = 0; v < size<0>(rF32); ++v) {
+            const float g_val = rF32(v, m, 0);
+            const float partner_g = __shfl_xor_sync(0xffffffff, g_val, 8);
+            if (valid_row) {
+                rF32(v, m, 0) = is_second_half_f32
+                    ? fmaf(g_val, c_arr[v], -partner_g * s_arr[v])
+                    : fmaf(g_val, c_arr[v], partner_g * s_arr[v]);
+            }
+        }
+    }
+}
 
 
 template <
@@ -40,25 +124,25 @@ template <
 >
 __global__ void __launch_bounds__(NUM_THREADS, 1)
 kernel_fused_mha_varlen_bwd(
-    const cutlass::half_t* __restrict__ dO_ptr,   // (H_q, Total_Lq, 64) [FP16] - Gradient đầu ra dO
-    const cutlass::half_t* __restrict__ Q_ptr,    // (H_q, Total_Lq, 64) [FP16] - Query gốc trước RoPE
-    const cutlass::half_t* __restrict__ K_ptr,    // (H_kv, Total_Lk, 64) [FP16] - Key gốc trước RoPE
-    const cutlass::half_t* __restrict__ V_ptr,    // (H_kv, Total_Lk, 64) [FP16] - Value gốc
-    const cutlass::half_t* __restrict__ O_ptr,    // (H_q, Total_Lq, 64) [FP16] - Output từ Forward
-    const float* __restrict__ LSE_ptr,            // (H_q, Total_Lq)     [FP32] - Log-Sum-Exp từ Forward
-    float* __restrict__ dQ_fp32_ptr,              // (H_q, Total_Lq, 64) [FP32] - Bộ đệm tích lũy atomic dQ
-    cutlass::half_t* __restrict__ dK_ptr,         // (H_kv, Total_Lk, 64) [FP16] - Gradient dK đầu ra
-    cutlass::half_t* __restrict__ dV_ptr,         // (H_kv, Total_Lk, 64) [FP16] - Gradient dV đầu ra
-    const int32_t* __restrict__ cu_seqlens_q_ptr, // (B + 1,) [Int32] - Độ dài tích lũy Q
-    const int32_t* __restrict__ cu_seqlens_k_ptr, // (B + 1,) [Int32] - Độ dài tích lũy K, V
-    const int32_t* __restrict__ offsets_ptr,      // (B,) [Int32] - Offset RoPE cho từng chuỗi (hoặc nullptr)
-    const cutlass::half_t* __restrict__ cos_ptr,  // (L_max, 64) [FP16] - Bảng cos RoPE (hoặc nullptr)
-    const cutlass::half_t* __restrict__ sin_ptr,  // (L_max, 64) [FP16] - Bảng sin RoPE (hoặc nullptr)
-    int H_q,                                      // scalar [int] - Số lượng head Query
-    int H_kv,                                     // scalar [int] - Số lượng head Key/Value
-    int Total_Lq,                                 // scalar [int] - Tổng số token Query
-    int Total_Lk,                                 // scalar [int] - Tổng số token Key/Value
-    float sm_scale                                // scalar [float] - Hệ số scale 1 / sqrt(64)
+    const cutlass::half_t* __restrict__ dO_ptr,   // (H_q, Total_Lq, 64) [FP16] - output gradient dO
+    const cutlass::half_t* __restrict__ Q_ptr,    // (H_q, Total_Lq, 64) [FP16] - unrotated query Q
+    const cutlass::half_t* __restrict__ K_ptr,    // (H_kv, Total_Lk, 64) [FP16] - unrotated key K
+    const cutlass::half_t* __restrict__ V_ptr,    // (H_kv, Total_Lk, 64) [FP16] - value V
+    const cutlass::half_t* __restrict__ O_ptr,    // (H_q, Total_Lq, 64) [FP16] - forward output O
+    const float* __restrict__ LSE_ptr,            // (H_q, Total_Lq)     [FP32] - forward LSE
+    float* __restrict__ dQ_fp32_ptr,              // (H_q, Total_Lq, 64) [FP32] - atomic dQ accumulator buffer
+    cutlass::half_t* __restrict__ dK_ptr,         // (H_kv, Total_Lk, 64) [FP16] - output gradient dK
+    cutlass::half_t* __restrict__ dV_ptr,         // (H_kv, Total_Lk, 64) [FP16] - output gradient dV
+    const int32_t* __restrict__ cu_seqlens_q_ptr, // (B + 1,) [Int32] - cumulative Q lengths
+    const int32_t* __restrict__ cu_seqlens_k_ptr, // (B + 1,) [Int32] - cumulative K/V lengths
+    const int32_t* __restrict__ offsets_ptr,      // (B,) [Int32] - per-sequence RoPE offset (or nullptr)
+    const cutlass::half_t* __restrict__ cos_ptr,  // (L_max, 64) [FP16] - RoPE cos table (or nullptr)
+    const cutlass::half_t* __restrict__ sin_ptr,  // (L_max, 64) [FP16] - RoPE sin table (or nullptr)
+    int H_q,                                      // scalar [int] - number of Q heads
+    int H_kv,                                     // scalar [int] - number of K/V heads
+    int Total_Lq,                                 // scalar [int] - total packed Q tokens
+    int Total_Lk,                                 // scalar [int] - total packed K/V tokens
+    float sm_scale                                // scalar [float] - 1 / sqrt(64) softmax scale
 ) {
     // 1. Coordinates, SMEM & tensor partitioning
     const int tid = static_cast<int>(threadIdx.x);
@@ -66,7 +150,7 @@ kernel_fused_mha_varlen_bwd(
     const int batch_idx = static_cast<int>(blockIdx.y);
     const int h_kv = static_cast<int>(blockIdx.z);
 
-    // Đọc metadata chuỗi biến thiên trực tiếp từ GMEM
+    // Read varlen sequence bounds from GMEM
     const int q_start_seq = cu_seqlens_q_ptr[batch_idx];
     const int q_end_seq = cu_seqlens_q_ptr[batch_idx + 1];
     const int lq_i = q_end_seq - q_start_seq;
@@ -77,14 +161,14 @@ kernel_fused_mha_varlen_bwd(
 
     const int k_start_col = block_k_idx * TILE_N;
     if (k_start_col >= lk_i) {
-        return; // Toàn bộ tile K nằm ngoài chiều dài thực tế của chuỗi
+        return; // Entire K tile is out of bounds
     }
 
     const int offset = (HAS_ROPE && offsets_ptr != nullptr) ? offsets_ptr[batch_idx] : 0;
     const int num_groups = H_q / H_kv;
     const int valid_k_rows = lk_i - k_start_col;
 
-    // Bố trí Dynamic Shared Memory (57,600 bytes <= 64 KB)
+    // Dynamic shared memory layout (57,600 B <= 64 KB)
     extern __shared__ uint8_t smem_raw[];
     cutlass::half_t* sQ_ptr = reinterpret_cast<cutlass::half_t*>(smem_raw);
     cutlass::half_t* sK_ptr = sQ_ptr + TILE_M * TILE_K;                // [8 KB .. 16 KB)
@@ -93,10 +177,10 @@ kernel_fused_mha_varlen_bwd(
     cutlass::half_t* sP_ptr = sDO_ptr + TILE_M * TILE_K;               // [32 KB .. 40 KB)
     cutlass::half_t* sStaging_ptr = sP_ptr + TILE_M * TILE_N;          // [40 KB .. 48 KB)
     cutlass::half_t* sdS_ptr = sStaging_ptr + TILE_M * TILE_N;         // [48 KB .. 56 KB)
-    float* sStaging_fp32_ptr = reinterpret_cast<float*>(sP_ptr);       // Tái sử dụng [32 KB .. 48 KB) (16 KB)
+    float* sStaging_fp32_ptr = reinterpret_cast<float*>(sP_ptr);       // Reuse [32 KB .. 48 KB) (16 KB)
     float* sD_ptr = reinterpret_cast<float*>(sdS_ptr + TILE_M * TILE_N); // [56 KB .. 56.25 KB)
 
-    // Khai báo kiểu CuTe Layouts, Copy Atoms và TiledMMA
+    // CuTe layouts, copy atoms, and TiledMMA types
     using Element = cutlass::half_t;
     using SmemLayoutFP16 = decltype(composition(
         Swizzle<3, 3, 3>{},
@@ -129,7 +213,7 @@ kernel_fused_mha_varlen_bwd(
     using S2RCopyAtomB_KMajor = Copy_Atom<SM75_U32x1_LDSM_N, Element>;
     using S2RCopyAtomB_MNMajor = Copy_Atom<SM75_U16x2_LDSM_T, Element>;
 
-    // Views SMEM (K-major và MN-major không xung đột bank)
+    // Swizzled K-major and MN-major SMEM views
     Tensor sQ = make_tensor(make_smem_ptr(sQ_ptr), SmemLayoutFP16{});
     Tensor sQ_mn = make_tensor(make_smem_ptr(sQ_ptr), SmemLayoutMN{});
     Tensor sK = make_tensor(make_smem_ptr(sK_ptr), SmemLayoutFP16{});
@@ -144,7 +228,7 @@ kernel_fused_mha_varlen_bwd(
     Tensor sdS_mn = make_tensor(make_smem_ptr(sdS_ptr), SmemLayoutMN{});
     Tensor sStaging_fp32 = make_tensor(make_smem_ptr(sStaging_fp32_ptr), SmemLayoutF32{});
 
-    // GMEM Tensors cố định của tile K, V, dK, dV cho CTA này
+    // GMEM tensors for K, V, dK, dV of this CTA
     const int64_t kv_tile_offset = static_cast<int64_t>(h_kv) * Total_Lk * TILE_K +
                                    static_cast<int64_t>(k_start_seq + k_start_col) * TILE_K;
     Tensor gK = make_tensor(make_gmem_ptr(K_ptr + kv_tile_offset),
@@ -160,7 +244,7 @@ kernel_fused_mha_varlen_bwd(
                              make_shape(Int<TILE_N>{}, Int<TILE_K>{}),
                              make_stride(Int<TILE_K>{}, _1{}));
 
-    // Khởi tạo Copy Thread Slices, Fragments và Predicates (một lần duy nhất)
+    // Thread slices, fragments, and boundary predicates
     TiledCopyG2R tiled_copy_g2r;
     auto thr_copy_g2r = tiled_copy_g2r.get_thread_slice(tid);
     Tensor tKgK = thr_copy_g2r.partition_S(gK);
@@ -190,7 +274,7 @@ kernel_fused_mha_varlen_bwd(
     tKpK(1, 0) = (row_m1_g2r < valid_k_rows);
     Tensor tQpQ = make_tensor<bool>(make_shape(size<1>(tQsQ), size<2>(tQsQ)));
 
-    // Staging FP32 (16x16 threads x 4 floats = 1 uint4) cho RoPE Backward dQ và dK
+    // FP32 staging (16x16 threads x 4 floats = uint4) for dQ/dK RoPE backward
     TiledCopyF32 tiled_copy_f32;
     auto thr_copy_f32 = tiled_copy_f32.get_thread_slice(tid);
     Tensor tStagingF32_S = thr_copy_f32.partition_S(sStaging_fp32);
@@ -204,17 +288,17 @@ kernel_fused_mha_varlen_bwd(
     auto thr_copy_fp16_16x16 = tiled_copy_fp16_16x16.get_thread_slice(tid);
     Tensor tStaging_D_16x16 = thr_copy_fp16_16x16.partition_D(sStaging);
 
-    // Khởi tạo MMA, Accumulators và S2R Partitions
+    // MMA, accumulators, and S2R partitions
     TiledMMA tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tid);
 
-    Tensor tCrC = thr_mma.partition_fragment_C(sP); // Tái sử dụng cho GEMM 1, 3, 5
+    Tensor tCrC = thr_mma.partition_fragment_C(sP); // Reused across GEMMs 1, 3, 5
     Tensor tCrDK = make_tensor_like(tCrC);
     Tensor tCrDV = make_tensor_like(tCrC);
     Tensor rC_fp16 = make_tensor_like<Element>(tCrC);
 
-    Tensor tCrA = thr_mma.partition_fragment_A(sQ); // Tái sử dụng cho cả 5 GEMM
-    Tensor tCrB = thr_mma.partition_fragment_B(sK); // Tái sử dụng cho cả 5 GEMM
+    Tensor tCrA = thr_mma.partition_fragment_A(sQ); // Shared operand fragment across all 5 GEMMs
+    Tensor tCrB = thr_mma.partition_fragment_B(sK); // Shared operand fragment across all 5 GEMMs
 
     auto s2r_copy_A_k = make_tiled_copy_A(S2RCopyAtomA_KMajor{}, tiled_mma);
     auto s2r_thr_A_k = s2r_copy_A_k.get_thread_slice(tid);
@@ -309,10 +393,10 @@ kernel_fused_mha_varlen_bwd(
             tQpQ(0, 0) = (row_m0_g2r < valid_q_rows);
             tQpQ(1, 0) = (row_m1_g2r < valid_q_rows);
 
-            // --- 3.1 Tải Q (áp RoPE), dO, O và tính D = rowsum(dO * O) ---
+            // 3.1 Load Q (+ RoPE), dO, O and compute D = rowsum(dO * O)
             clear(rQ);
             clear(rDO);
-            clear(rV); // Tạm mượn rV giữ O (rV không dùng đến trước Epilogue)
+            clear(rV); // Temporarily reuse rV for O (unused until Epilogue)
 
             cute::copy_if(tiled_copy_g2r, tQpQ, tQgQ, rQ);
             cute::copy_if(tiled_copy_g2r, tQpQ, tDOgDO, rDO);
@@ -324,7 +408,7 @@ kernel_fused_mha_varlen_bwd(
                     row_m0_g2r, row_m1_g2r, col_vec_g2r, is_second_half_g2r);
             }
 
-            // Tính D_i = sum_d (dO[i, d] * O[i, d]) bằng giảm 8 làn trong warp
+            // Compute D_i = sum_d (dO[i, d] * O[i, d]) via 8-lane reduction
             CUTE_UNROLL
             for (int m = 0; m < size<1>(rDO); ++m) {
                 float partial_d = 0.0f;
@@ -345,7 +429,7 @@ kernel_fused_mha_varlen_bwd(
             cute::copy(rDO, tDOsDO);
             __syncthreads();
 
-            // --- 3.2 GEMM 1: S = Q @ K^T -> P = exp(scale * S - LSE) -> lưu sP ---
+            // 3.2 GEMM 1: S = Q @ K^T -> P = exp(scale * S - LSE) -> sP
             clear(tCrC);
             CUTE_UNROLL
             for (int k_step = 0; k_step < size<2>(tCrA); ++k_step) {
@@ -391,7 +475,7 @@ kernel_fused_mha_varlen_bwd(
             cute::copy(rC_fp16, tCsP_C);
             __syncthreads();
 
-            // --- 3.3 GEMM 2: dV += P^T @ dO (tích lũy FP32 vào tCrDV) ---
+            // 3.3 GEMM 2: dV += P^T @ dO (FP32 accumulate in tCrDV)
             CUTE_UNROLL
             for (int k_step = 0; k_step < size<2>(tCrA); ++k_step) {
                 cute::copy(s2r_copy_A_mn, tAsP_mn(_, _, k_step), tArA_mn(_, _, k_step));
@@ -399,7 +483,7 @@ kernel_fused_mha_varlen_bwd(
                 cute::gemm(tiled_mma, tCrA(_, _, k_step), tCrB(_, _, k_step), tCrDV);
             }
 
-            // --- 3.4 GEMM 3: dP = dO @ V^T -> dS_unscaled = P * (dP - D) -> lưu sdS ---
+            // 3.4 GEMM 3: dP = dO @ V^T -> dS_unscaled = P * (dP - D) -> sdS
             clear(tCrC);
             CUTE_UNROLL
             for (int k_step = 0; k_step < size<2>(tCrA); ++k_step) {
@@ -408,7 +492,7 @@ kernel_fused_mha_varlen_bwd(
                 cute::gemm(tiled_mma, tCrA(_, _, k_step), tCrB(_, _, k_step), tCrC);
             }
 
-            // Tải P từ sP về rC_fp16 để tính dS trên thanh ghi (tránh nhân sm_scale sớm để bảo toàn dynamic range FP16)
+            // Load P from sP into registers to compute dS (defer sm_scale for FP16 dynamic range)
             cute::copy(tCsP_C, rC_fp16);
             const float D_a = sD_ptr[mma_row_a];
             const float D_b = sD_ptr[mma_row_b];
@@ -429,7 +513,7 @@ kernel_fused_mha_varlen_bwd(
             cute::copy(rC_fp16, tCsDS_C);
             __syncthreads();
 
-            // --- 3.5 GEMM 4: dK += dS^T @ Q (tích lũy FP32 vào tCrDK) ---
+            // 3.5 GEMM 4: dK += dS^T @ Q (FP32 accumulate in tCrDK)
             CUTE_UNROLL
             for (int k_step = 0; k_step < size<2>(tCrA); ++k_step) {
                 cute::copy(s2r_copy_A_mn, tAsDS_mn(_, _, k_step), tArA_mn(_, _, k_step));
@@ -451,7 +535,7 @@ kernel_fused_mha_varlen_bwd(
                 tCrC(i) *= sm_scale;
             }
 
-            // Ghi dQ_local FP32 vào sStaging_fp32 (vùng [32KB..48KB) hoàn toàn tách rời sdS [48KB..56KB))
+            // Store dQ_local FP32 into sStaging_fp32 ([32KB..48KB), disjoint from sdS [48KB..56KB))
             cute::copy(tCrC, tCsStagingF32_C);
             __syncthreads();
 
@@ -463,7 +547,7 @@ kernel_fused_mha_varlen_bwd(
                     row_in_step_f32, col_vec_f32, is_second_half_f32);
             }
 
-            // Cộng dồn an toàn giữa các block_k_idx vào bộ đệm FP32 GMEM
+            // Atomic accumulation across K blocks into FP32 dQ buffer
             CUTE_UNROLL
             for (int m = 0; m < size<1>(rF32); ++m) {
                 const int row_q = m * 16 + row_in_step_f32;
@@ -474,12 +558,12 @@ kernel_fused_mha_varlen_bwd(
                     }
                 }
             }
-            __syncthreads(); // Bảo vệ toàn bộ SMEM trước lượt Q kế tiếp hoặc Epilogue
+            __syncthreads(); // Protect SMEM before next Q block or Epilogue
         }
     }
 
     // 4. Epilogue: store dV and dK
-    // 4.1 Xuất dV: FP32 thanh ghi -> FP16 thanh ghi -> sStaging -> GMEM 128-bit coalesced
+    // 4.1 Store dV: FP32 -> FP16 -> sStaging -> 128-bit coalesced GMEM
     CUTE_UNROLL
     for (int i = 0; i < size(tCrDV); ++i) {
         rC_fp16(i) = float_to_out<Element>(tCrDV(i));
@@ -489,9 +573,9 @@ kernel_fused_mha_varlen_bwd(
 
     cute::copy(tiled_copy_g2r, tStaging_S, rV);
     cute::copy_if(tiled_copy_g2r, tKpK, rV, tDVgDV);
-    __syncthreads(); // Chờ đọc xong sStaging trước khi dK dùng sStaging_fp32 hoặc sStaging
+    __syncthreads(); // Wait for dV reads from sStaging before reusing SMEM for dK
 
-    // 4.2 Xuất dK: Nhân sm_scale -> RoPE Backward (nếu HAS_ROPE) -> sStaging -> GMEM 128-bit coalesced
+    // 4.2 Store dK: apply sm_scale -> RoPE backward (if HAS_ROPE) -> sStaging -> 128-bit GMEM
     CUTE_UNROLL
     for (int i = 0; i < size(tCrDK); ++i) {
         tCrDK(i) *= sm_scale;
@@ -502,7 +586,7 @@ kernel_fused_mha_varlen_bwd(
         __syncthreads();
 
         cute::copy(tiled_copy_f32, tStagingF32_S, rF32);
-        __syncthreads(); // Bắt buộc đợi toàn bộ đọc xong sStaging_fp32 trước khi ghi sStaging ([40KB..48KB))
+        __syncthreads(); // Wait for all sStaging_fp32 reads before writing sStaging ([40KB..48KB))
 
         apply_rope_bwd_f32_16x16<TILE_K>(
             rF32, cos_ptr, sin_ptr, k_start_col, offset, valid_k_rows,
@@ -529,24 +613,24 @@ kernel_fused_mha_varlen_bwd(
 }
 
 // =================================================================================================
-// PHẦN 2: HOST FUNCTION
+// 2. Host Function
 // =================================================================================================
 
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_mha_varlen_bwd(
-    const at::Tensor& do_grad,                        // (H_q, Total_Lq, 64) [FP16] - Gradient đầu ra dO
-    const at::Tensor& q,                              // (H_q, Total_Lq, 64) [FP16] - Query gốc trước RoPE
-    const at::Tensor& k,                              // (H_kv, Total_Lk, 64) [FP16] - Key gốc trước RoPE
-    const at::Tensor& v,                              // (H_kv, Total_Lk, 64) [FP16] - Value gốc
-    const at::Tensor& o,                              // (H_q, Total_Lq, 64) [FP16] - Output từ Forward
-    const at::Tensor& lse,                            // (H_q, Total_Lq)     [FP32] - Log-Sum-Exp từ Forward
-    const at::Tensor& cu_seqlens_q,                   // (B + 1,) [Int32] - Độ dài tích lũy của Q
-    const at::Tensor& cu_seqlens_k,                   // (B + 1,) [Int32] - Độ dài tích lũy của K, V
-    const std::optional<at::Tensor>& offsets,         // (B,) [Int32] - Offset RoPE cho từng chuỗi (optional)
-    int64_t max_seqlen_k,                             // scalar [int64] - Độ dài K lớn nhất trong batch
-    const std::optional<at::Tensor>& cos,             // (L_max, 64) [FP16] - Bảng cos RoPE (optional)
-    const std::optional<at::Tensor>& sin,             // (L_max, 64) [FP16] - Bảng sin RoPE (optional)
-    bool is_causal                                    // scalar [bool] - Cờ Causal Mask
+    const at::Tensor& do_grad,                        // (H_q, Total_Lq, 64) [FP16] - output gradient dO
+    const at::Tensor& q,                              // (H_q, Total_Lq, 64) [FP16] - unrotated query Q
+    const at::Tensor& k,                              // (H_kv, Total_Lk, 64) [FP16] - unrotated key K
+    const at::Tensor& v,                              // (H_kv, Total_Lk, 64) [FP16] - value V
+    const at::Tensor& o,                              // (H_q, Total_Lq, 64) [FP16] - forward output O
+    const at::Tensor& lse,                            // (H_q, Total_Lq)     [FP32] - forward LSE
+    const at::Tensor& cu_seqlens_q,                   // (B + 1,) [Int32]
+    const at::Tensor& cu_seqlens_k,                   // (B + 1,) [Int32]
+    const std::optional<at::Tensor>& offsets,         // (B,) [Int32] (optional)
+    int64_t max_seqlen_k,                             // scalar [int64] - max K sequence length
+    const std::optional<at::Tensor>& cos,             // (L_max, 64) [FP16] (optional)
+    const std::optional<at::Tensor>& sin,             // (L_max, 64) [FP16] (optional)
+    bool is_causal                                    // scalar [bool] - causal mask flag
 ) {
     // 1. Torch Checks
     TORCH_CHECK(do_grad.is_cuda(), "do_grad must be a CUDA tensor");
@@ -626,7 +710,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_mha_varlen_bwd(
         }
     }
 
-    // 2. Cấp phát bộ đệm và khởi chạy kernel
+    // 2. Buffer allocation and kernel launch
     const c10::cuda::CUDAGuard device_guard(q.device());
 
     at::Tensor dk = at::zeros_like(k);
@@ -719,7 +803,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_mha_varlen_bwd(
         }
     }
 
-    // 3. Ép kiểu dQ về FP16, giải phóng bộ đệm FP32 và trả kết quả
+    // 3. Cast dQ to FP16, release FP32 buffer, and return outputs
     at::Tensor dq = dq_fp32.to(at::kHalf);
     dq_fp32 = at::Tensor();
 

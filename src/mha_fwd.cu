@@ -135,7 +135,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     Tensor gQ = local_tile(mQ, make_tile(Int<TILE_M>{}, Int<TILE_K>{}), make_coord(block_q_idx, 0));
     Tensor gO = local_tile(mO, make_tile(Int<TILE_M>{}, Int<TILE_K>{}), make_coord(block_q_idx, 0));
 
-    // Phân mảnh GMEM <-> SMEM bằng TiledCopy 128-bit
+    // 128-bit GMEM <-> SMEM TiledCopy partitions
     TiledCopyG2R tiled_copy_g2r;
     auto thr_copy_g2r = tiled_copy_g2r.get_slice(tid);
 
@@ -145,7 +145,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     auto tOsBuf1 = thr_copy_g2r.partition_S(sBuf1);
     auto tOgO    = thr_copy_g2r.partition_D(gO);
 
-    // Khai báo fragment thanh ghi staging căn chỉnh 16-byte cho g2r -> RoPE -> r2s
+    // 16-byte aligned staging fragments for g2r -> RoPE -> r2s
     constexpr int FRAG_ELEMS = (TILE_M * TILE_K) / NUM_THREADS;
     auto frag_layout = make_layout(shape(tQgQ));
     alignas(16) Element buf_stage[FRAG_ELEMS];
@@ -215,7 +215,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     auto tBsBuf1_s2r   = thr_s2r_b_mn.partition_S(sBuf1_V_mn);
     auto tCsBuf1_C     = thr_mma.partition_C(sBuf1);
 
-    // tCrQ giữ Q cố định trên thanh ghi; (tCrA, tCrB) dùng chung cho S = Q@K^T và O += P@V
+    // tCrQ holds Q; (tCrA, tCrB) are shared between S = Q@K^T and O += P@V
     Tensor tCrQ = thr_mma.partition_fragment_A(sBuf0);
     Tensor tCrA = thr_mma.partition_fragment_A(sBuf0);
     Tensor tCrB = thr_mma.partition_fragment_B(sBuf0);
@@ -239,7 +239,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     float l_old_a = 0.0f;
     float l_old_b = 0.0f;
 
-    // Lambda g2r: Nạp vector 128-bit từ GMEM vào thanh ghi staging
+    // Load 128-bit vector from GMEM to staging registers
     auto g2r_load = [&](auto const& tSrc, auto& rDst, auto const& pred, bool in_bounds) {
         if (in_bounds) {
             cute::copy(tiled_copy_g2r, tSrc, rDst);
@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         }
     };
 
-    // Lambda RoPE thuận: Xoay trực tiếp trên thanh ghi staging dùng __shfl_xor_sync(..., 4)
+    // Forward RoPE rotation in registers using __shfl_xor_sync(..., 4)
     auto apply_rope_reg = [&]() {
         #pragma unroll
         for (int m = 0; m < size<1>(rStage); ++m) {
@@ -274,7 +274,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     };
 
     // -------------------------------------------------------------------------------------
-    // Bước 2 (Prologue): Nạp Q (+ RoPE) giữ cố định vào tCrQ, sau đó Prefetch K_0 vào sBuf0
+    // 2. Prologue: load Q (+ RoPE) into tCrQ and prefetch K_0 into sBuf0
     // -------------------------------------------------------------------------------------
     g2r_load(tQgQ, rStage, tQpQ, q_in_bounds);
     if constexpr (HAS_ROPE) {
@@ -287,11 +287,11 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     r2s_store(rStage, tQsBuf0);
     __syncthreads();
 
-    // Đọc Q đã xoay từ sBuf0 lên tCrQ qua LDSM_N và giữ cố định suốt vòng đời kernel
+    // Load rotated Q from sBuf0 into tCrQ via LDSM_N
     cute::copy(s2r_copy_a, tAsBuf0_s2r, tCrQ_s2r_view);
     __syncthreads();
 
-    // Prefetch block K_0 (+ RoPE) vào sBuf0 chuẩn bị cho vòng lặp đầu tiên
+    // Prefetch K_0 (+ RoPE) into sBuf0 for the first iteration
     if (num_k_blocks > 0) {
         const bool k0_in_bounds = (0 < last_k_block_idx) || last_k_in_bounds;
         Tensor gK_0 = local_tile(mK, make_tile(Int<TILE_N>{}, Int<TILE_K>{}), make_coord(0, 0));
@@ -308,13 +308,13 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     }
 
     // -------------------------------------------------------------------------------------
-    // Bước 3 (Main Loop): Pipeline 2 lần đọc / 1 stage qua các block K, V của chuỗi seq_idx
+    // 3. Main loop over K/V blocks of sequence seq_idx
     // -------------------------------------------------------------------------------------
     for (int k_tile = 0; k_tile < num_k_blocks; ++k_tile) {
         const int  k_start_col      = k_tile * TILE_N;
         const bool curr_k_in_bounds = (k_tile < last_k_block_idx) || last_k_in_bounds;
 
-        // --- Pha 1: S = Q @ K^T song song với Prefetch V_curr ---
+        // Compute S = Q @ K^T while prefetching V_curr
         Tensor gV_curr = local_tile(mV, make_tile(Int<TILE_N>{}, Int<TILE_K>{}), make_coord(k_tile, 0));
         g2r_load(thr_copy_g2r.partition_S(gV_curr), rStage, tKpK, curr_k_in_bounds);
 
@@ -323,7 +323,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         cute::clear(tCrS);
         cute::gemm(tiled_mma, tCrQ, tCrB, tCrS);
 
-        // Xả V_curr đã prefetch vào sBuf1 (r2s) và đồng bộ cho Pha 3
+        // Write prefetched V_curr to sBuf1 and sync
         r2s_store(rStage, tVsBuf1);
         __syncthreads();
 
@@ -360,7 +360,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
 
         #pragma unroll
         for (int n = 0; n < size<2>(tCrS); ++n) {
-            // Rescale accumulator tCrO theo tỉ lệ alpha mới
+            // Rescale accumulator tCrO by alpha
             tCrO(0, 0, n) *= alpha_a;
             tCrO(1, 0, n) *= alpha_a;
             tCrO(2, 0, n) *= alpha_b;
@@ -394,7 +394,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         l_old_a = fmaf(l_old_a, alpha_a, row_sum_a);
         l_old_b = fmaf(l_old_b, alpha_b, row_sum_b);
 
-        // --- Pha 3: O += P @ V song song với Prefetch K_next ---
+        // Compute O += P @ V while prefetching K_next
         const bool has_next = (k_tile + 1 < num_k_blocks);
         if (has_next) {
             const bool next_k_in_bounds = (k_tile + 1 < last_k_block_idx) || last_k_in_bounds;
@@ -412,7 +412,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         cute::copy(s2r_copy_b_mn, tBsBuf1_s2r, tCrB_mn_view);
         cute::gemm(tiled_mma, tCrA, tCrB, tCrO);
 
-        // Xoay RoPE và xả K_next xuống sBuf0 (sBuf0 đã hoàn tất đọc từ cuối Pha 1)
+        // Apply RoPE and write K_next to sBuf0
         if (has_next) {
             if constexpr (HAS_ROPE) {
                 apply_rope_reg();
@@ -450,7 +450,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     cute::copy(rO_fp16, tCsBuf1_C);
     __syncthreads();
 
-    // S2G: Đọc từ sBuf1 qua Swizzle và ghi vector hóa 128-bit ra gO
+    // S2G: vectorized 128-bit store from swizzled sBuf1 to gO
     if (q_in_bounds) {
         cute::copy(tiled_copy_g2r, tOsBuf1, tOgO);
     } else {
@@ -537,7 +537,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     // -------------------------------------------------------------------------------------
     // 2. Kernel launch setup
     // -------------------------------------------------------------------------------------
-    // Bước 1: Xử lý trường hợp biên rỗng và cấp phát trước tensor output o (FP16), lse (FP32)
+    // Handle empty inputs and allocate o (FP16), lse (FP32)
     if (Total_Lq == 0 || max_seqlen_q <= 0 || B <= 0) {
         return std::make_tuple(
             torch::zeros_like(q),
@@ -548,7 +548,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     at::Tensor o   = torch::empty_like(q);
     at::Tensor lse = torch::empty({H_q, Total_Lq}, q.options().dtype(at::kFloat));
 
-    // Bước 2: Hằng số & Cấu hình Launch
+    // Kernel launch constants
     using Element = cutlass::half_t;
     constexpr int TILE_M      = 64;
     constexpr int TILE_N      = 64;
@@ -592,7 +592,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     using MMAAtom      = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
     using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_4, _1, _1>, Stride<_1, _4, _4>>>;
 
-    // Bước 6: Lấy CUDA Stream hiện tại
+    // Current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     const Element* q_ptr       = reinterpret_cast<const Element*>(q.data_ptr<at::Half>());
@@ -664,7 +664,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
         }
     }
 
-    // Bước 8: Không có tensor trung gian cần giải phóng
+    // No intermediate buffers to release
 
     // -------------------------------------------------------------------------------------
     // 3. Return outputs

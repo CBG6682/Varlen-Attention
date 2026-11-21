@@ -186,13 +186,16 @@ if should_compile:
     ]
 
     class Cpp20WithCpp17FallbackBuildExtension(BuildExtension):
-        """Compile with C++20 by default; fall back to C++17 only on build error."""
+        """Compile with C++20 by default; fall back to C++17 only on legacy PyTorch (<2.1)."""
 
         def build_extensions(self):
             try:
                 super().build_extensions()
             except Exception as exc:
-                if os.environ.get("CXX_STANDARD") == "c++17":
+                major_minor = tuple(
+                    int(x) for x in torch.__version__.split("+")[0].split(".")[:2] if x.isdigit()
+                )
+                if os.environ.get("CXX_STANDARD") == "c++17" or major_minor >= (2, 1):
                     raise
                 print(f"[setup.py] C++20 build failed ({exc}). Falling back to C++17...")
                 for ext in self.extensions:
