@@ -149,11 +149,14 @@ python tests/bench_inference.py --e2e-quick --save-plot assets/inference_benchma
 
 For an end-to-end walkthrough (including building reusable `.whl` packages and profiling all 3 kernels with `ncu --set full` into `Benchmark/*.ncu-rep`), open [Benchmark/demo_varlen_transformer.ipynb](Benchmark/demo_varlen_transformer.ipynb).
 
-### Benchmark Plots
+### Benchmark Notes & Plots
+
+- **Fair `SDPBackend.EFFICIENT_ATTENTION` Baseline on SM75:** On Turing (`SM75`), PyTorch `F.scaled_dot_product_attention` falls back to the slow `MATH` backend if given a `bool` padding mask. For a fair and competitive baseline, the inference benchmark converts `pad_mask` into an **additive `float16` mask (`0.0` / `-inf`)** and aligns the KV sequence dimension `L` to a **multiple of 8** (`stride(-2) % 8 == 0`), explicitly activating `SDPBackend.EFFICIENT_ATTENTION`.
+- **Optional FlashAttention-1 Baseline:** If `flash-attn` v1.x (`flash_attn_unpadded_func`, supporting SM75) is installed, both `bench_training.py` and `bench_inference.py` automatically include FlashAttention-1 (with external RoPE + KV head repeat) in the comparison tables and plots.
 
 Run the benchmark scripts or demo notebook on an SM75 GPU to generate the comparison plots in `assets/`:
-- `assets/training_benchmark.png` — Training Forward+Backward latency, speedup, and peak VRAM.
-- `assets/inference_benchmark.png` — Cold-L2 Decode latency, effective HBM bandwidth (GB/s), and TPOT.
+- `assets/training_benchmark.png` — Training Forward+Backward latency, speedup, and peak VRAM (with `%` savings annotations).
+- `assets/inference_benchmark.png` — `2x2` summary: Cold-L2 Decode `L_q=1` latency, E2E Generation TPOT, Total E2E Latency, and E2E Peak VRAM (Baseline vs Direct 1-Block vs Split-K Flash Decoding).
 
 ---
 

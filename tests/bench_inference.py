@@ -10,11 +10,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    _HAS_SDPA_KERNEL = True
+except ImportError:
+    SDPBackend = None
+    sdpa_kernel = None
+    _HAS_SDPA_KERNEL = False
+
 _ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
 from tests.utils import (
+    HAS_FLASH_ATTN_1,
+    FlashAttention1VarlenBaseline,
+    align_up,
+    build_additive_padding_mask,
+    build_packed_rope_positions,
     build_padding_mask,
     compute_decode_bandwidth_gbps,
     cuda_benchmark,
@@ -161,7 +175,7 @@ def _save_inference_plot(
             ax2.set_title("Part B: E2E Generation TPOT (ms/token) [Eager]")
 
         ax2.bar([i - w3 for i in e_idx], b_tpot, w3, label="Baseline (Batched SDPA)", color="#e63946")
-        ax2.bar(e_idx, d_tpot, w3, label="Direct 1-Block (Thuong)", color="#457b9d")
+        ax2.bar(e_idx, d_tpot, w3, label="Direct 1-Block", color="#457b9d")
         ax2.bar([i + w3 for i in e_idx], s_tpot, w3, label="Flash Decoding (Split-K)", color="#2a9d8f")
         for i in e_idx:
             best_v = min(d_tpot[i], s_tpot[i])
@@ -195,7 +209,7 @@ def _save_inference_plot(
             ax3.set_title("Part B: Total E2E Latency (Prefill + Gen) [Eager]")
 
         ax3.bar([i - w3 for i in e_idx], b_e2e, w3, label="Baseline (Batched SDPA)", color="#e63946")
-        ax3.bar(e_idx, d_e2e, w3, label="Direct 1-Block (Thuong)", color="#457b9d")
+        ax3.bar(e_idx, d_e2e, w3, label="Direct 1-Block", color="#457b9d")
         ax3.bar([i + w3 for i in e_idx], s_e2e, w3, label="Flash Decoding (Split-K)", color="#2a9d8f")
         for i in e_idx:
             best_v = min(d_e2e[i], s_e2e[i])
@@ -328,6 +342,9 @@ def run_inference_benchmark(
         def _c_batched_dec(q_b, k_b, v_b, pad_m, sc_val, rep_val):
             k_exp = _repeat_kv_batched(k_b, rep_val)
             v_exp = _repeat_kv_batched(v_b, rep_val)
+            if _HAS_SDPA_KERNEL:
+                with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                    return F.scaled_dot_product_attention(q_b, k_exp, v_exp, attn_mask=pad_m, scale=sc_val)
             return F.scaled_dot_product_attention(q_b, k_exp, v_exp, attn_mask=pad_m, scale=sc_val)
 
         compiled_batched_dec = _compile_or_warn(_c_batched_dec, "batched_sdpa_decode")
@@ -345,11 +362,13 @@ def run_inference_benchmark(
                 total_lk = int(cu_seqlens[-1].item())
 
                 try:
-                    # 1. Batched SDPA Decode Baseline
+                    # 1. Batched SDPA Decode Baseline (FP16 additive mask + L%8 aligned for EFFICIENT_ATTENTION)
+                    pad_mask, aligned_max = build_additive_padding_mask(
+                        cu_seqlens, actual_max, dtype=torch.float16, align_to=8
+                    )
                     q_batched = torch.randn((B, num_heads_q, 1, head_dim), device=dev, dtype=torch.float16)
-                    k_batched = torch.randn((B, num_heads_kv, actual_max, head_dim), device=dev, dtype=torch.float16)
-                    v_batched = torch.randn((B, num_heads_kv, actual_max, head_dim), device=dev, dtype=torch.float16)
-                    pad_mask = build_padding_mask(cu_seqlens, actual_max)
+                    k_batched = torch.randn((B, num_heads_kv, aligned_max, head_dim), device=dev, dtype=torch.float16)
+                    v_batched = torch.randn((B, num_heads_kv, aligned_max, head_dim), device=dev, dtype=torch.float16)
                     q_batched_roped = rope(q_batched, offset=actual_max - 1) if rope is not None else q_batched
 
                     b_comp_ms: Optional[float] = None
@@ -368,6 +387,11 @@ def run_inference_benchmark(
                         with torch.no_grad():
                             k_exp = _repeat_kv_batched(k_batched, rep_gqa)
                             v_exp = _repeat_kv_batched(v_batched, rep_gqa)
+                            if _HAS_SDPA_KERNEL:
+                                with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                                    return F.scaled_dot_product_attention(
+                                        q_batched_roped, k_exp, v_exp, attn_mask=pad_mask, scale=scale
+                                    )
                             return F.scaled_dot_product_attention(
                                 q_batched_roped, k_exp, v_exp, attn_mask=pad_mask, scale=scale
                             )
@@ -570,6 +594,13 @@ def run_inference_benchmark(
     )
     mod_batched.load_state_dict(mod_varlen.state_dict())
 
+    mod_fa1 = None
+    if HAS_FLASH_ATTN_1:
+        mod_fa1 = FlashAttention1VarlenBaseline(
+            embed_dim, num_heads_q, num_heads_kv, rope=rope, bias=False
+        ).to(device=dev, dtype=torch.float16)
+        mod_fa1.load_state_dict(mod_varlen.state_dict())
+
     mod_varlen_comp = _compile_or_warn(mod_varlen, "VarlenFlashGQA") if include_compile else None
     mod_batched_comp = _compile_or_warn(mod_batched, "BatchedFlashGQA") if include_compile else None
 
@@ -631,7 +662,11 @@ def run_inference_benchmark(
             v_all = torch.cat([past_v, v], dim=2)
             k_exp = _repeat_kv_batched(k_all, rep_gqa)
             v_exp = _repeat_kv_batched(v_all, rep_gqa)
-            out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=step_mask, scale=scale)
+            if _HAS_SDPA_KERNEL:
+                with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                    out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=step_mask, scale=scale)
+            else:
+                out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=step_mask, scale=scale)
             out_flat = out.transpose(1, 2).contiguous().view(B_sz, 1, -1)
             return mod_batched.out_proj(out_flat), k_all, v_all
 
@@ -693,15 +728,16 @@ def run_inference_benchmark(
             x_step_p_cpu = x_step_b.squeeze(1).contiguous().cpu()
 
             total_kv_cap = actual_max + gen_steps
-            pos_dec = torch.arange(total_kv_cap, device=dev, dtype=torch.int32).unsqueeze(0)
-            full_dec_mask = ((pos_dec < seqlens.unsqueeze(1)) | (pos_dec >= actual_max)).view(
-                B, 1, 1, total_kv_cap
-            )
+            total_kv_cap_aligned = align_up(total_kv_cap, 8)
+            pos_dec = torch.arange(total_kv_cap_aligned, device=dev, dtype=torch.int32).unsqueeze(0)
+            valid_dec = (pos_dec < seqlens.unsqueeze(1)) | (pos_dec >= actual_max)
+            full_dec_mask = torch.zeros((B, 1, 1, total_kv_cap_aligned), device=dev, dtype=torch.float16)
+            full_dec_mask.masked_fill_(~valid_dec.unsqueeze(1).unsqueeze(1), float("-inf"))
             step_masks = [full_dec_mask[:, :, :, : actual_max + step + 1] for step in range(gen_steps)]
             offset_tensors = [
                 torch.tensor(actual_max + step, device=dev, dtype=torch.int64) for step in range(gen_steps)
             ]
-            del pos_prefill, valid_prefill_tok, pos_dec
+            del pos_prefill, valid_prefill_tok, pos_dec, valid_dec
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -1026,6 +1062,25 @@ def run_inference_benchmark(
             )
             v_dir_eager_tpot_ms = v_dir_eager_gen_ms / float(gen_steps)
             v_spk_eager_tpot_ms = v_spk_eager_gen_ms / float(gen_steps)
+
+            fa1_ttft_ms: Optional[float] = None
+            if mod_fa1 is not None:
+                fa1_pos_ids = build_packed_rope_positions(cu_seqlens) if use_rope else None
+
+                def _fa1_ttft_fn():
+                    with torch.no_grad():
+                        return mod_fa1(
+                            x_prefill_p,
+                            cu_seqlens_q=cu_seqlens,
+                            max_seqlen_q=actual_max,
+                            max_seqlen_k=actual_max,
+                            is_causal=True,
+                            pos_ids=fa1_pos_ids,
+                        )
+
+                fa1_ttft_ms, _, _ = cuda_benchmark(_fa1_ttft_fn, warmup=warmup // 2, rep=min(20, rep))
+                del fa1_pos_ids
+
             del init_v_eager_cache, x_prefill_p, x_step_p
             gc.collect()
             torch.cuda.empty_cache()
@@ -1086,42 +1141,42 @@ def run_inference_benchmark(
                 "varlen_direct_vram_mb": v_dir_vram_mb,
                 "varlen_splitk_vram_mb": v_spk_vram_mb,
                 "batched_vram_mb": b_vram_mb,
+                "fa1_ttft_ms": fa1_ttft_ms,
             }
         )
 
-        e2e_rows.append(
-            [
-                str(B),
-                str(actual_max),
-                f"{pad_waste_pct:.1f}%",
-                f"{ref_b_ttft:.2f}",
-                f"{ref_v_ttft:.2f} ({ttft_spd:.2f}x)",
-                f"{ref_b_tpot:.3f}",
-                f"{ref_d_tpot:.3f} ({tpot_spd_dir:.2f}x)",
-                f"{ref_s_tpot:.3f} ({tpot_spd_spk:.2f}x)",
-                f"{e2e_spd_dir:.2f}x / {e2e_spd_spk:.2f}x",
-                f"{v_dir_vram_mb:.1f} / {v_spk_vram_mb:.1f} / {b_vram_mb:.1f}",
-            ]
-        )
+        e2e_row = [
+            str(B),
+            str(actual_max),
+            f"{pad_waste_pct:.1f}%",
+            f"{ref_b_ttft:.2f}",
+            f"{ref_v_ttft:.2f} ({ttft_spd:.2f}x)",
+            f"{ref_b_tpot:.3f}",
+            f"{ref_d_tpot:.3f} ({tpot_spd_dir:.2f}x)",
+            f"{ref_s_tpot:.3f} ({tpot_spd_spk:.2f}x)",
+            f"{e2e_spd_dir:.2f}x / {e2e_spd_spk:.2f}x",
+            f"{v_dir_vram_mb:.1f} / {v_spk_vram_mb:.1f} / {b_vram_mb:.1f}",
+        ]
+        if HAS_FLASH_ATTN_1:
+            e2e_row.insert(5, f"{fa1_ttft_ms:.2f}" if fa1_ttft_ms is not None else "N/A")
+        e2e_rows.append(e2e_row)
 
-    print(
-        "\n"
-        + format_markdown_table(
-            [
-                "B",
-                "MaxL",
-                "Pad%",
-                "Base TTFT(ms)",
-                "Ours TTFT(ms)",
-                "Base TPOT(ms)",
-                "Direct TPOT(ms)",
-                "SplitK TPOT(ms)",
-                "E2E Spd (Dir/SpK)",
-                "E2E VRAM MB (Dir/SpK/Base)",
-            ],
-            e2e_rows,
-        )
-    )
+    e2e_headers = [
+        "B",
+        "MaxL",
+        "Pad%",
+        "Base TTFT(ms)",
+        "Ours TTFT(ms)",
+        "Base TPOT(ms)",
+        "Direct TPOT(ms)",
+        "SplitK TPOT(ms)",
+        "E2E Spd (Dir/SpK)",
+        "E2E VRAM MB (Dir/SpK/Base)",
+    ]
+    if HAS_FLASH_ATTN_1:
+        e2e_headers.insert(5, "FA1 TTFT(ms)")
+
+    print("\n" + format_markdown_table(e2e_headers, e2e_rows))
 
     if save_plot:
         _save_inference_plot(decode_results, e2e_results, save_plot)

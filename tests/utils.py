@@ -1,9 +1,24 @@
 """Benchmarking, profiling, and tensor-packing utilities for Varlen Transformer."""
 
+import math
 import random
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn as nn
+
+try:
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_func as _fa1_unpadded_func
+
+    HAS_FLASH_ATTN_1 = True
+except ImportError:
+    try:
+        from flash_attn import flash_attn_varlen_func as _fa1_unpadded_func
+
+        HAS_FLASH_ATTN_1 = True
+    except ImportError:
+        _fa1_unpadded_func = None
+        HAS_FLASH_ATTN_1 = False
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -141,6 +156,33 @@ def build_padding_mask(cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tenso
     positions = torch.arange(max_seqlen, device=cu_seqlens.device, dtype=seqlens.dtype)
     mask = positions.unsqueeze(0) < seqlens.unsqueeze(1)  # (B, max_seqlen)
     return mask.unsqueeze(1).unsqueeze(1)
+
+
+def align_up(value: int, alignment: int = 8) -> int:
+    """Round integer `value` up to a multiple of `alignment`."""
+    if alignment <= 1:
+        return int(value)
+    return ((int(value) + alignment - 1) // alignment) * alignment
+
+
+def build_additive_padding_mask(
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    dtype: torch.dtype = torch.float16,
+    align_to: int = 8,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Build FP16 additive padding mask `(B, 1, 1, aligned_len)` (0.0 = valid, -inf = masked)
+    with last dimension aligned to a multiple of `align_to` (8 for 16B / Efficient Attention).
+    """
+    aligned_len = max(align_to, align_up(max_seqlen, align_to))
+    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+    B = int(seqlens.shape[0])
+    positions = torch.arange(aligned_len, device=cu_seqlens.device, dtype=seqlens.dtype)
+    valid = positions.unsqueeze(0) < seqlens.unsqueeze(1)  # (B, aligned_len)
+    mask = torch.zeros((B, 1, 1, aligned_len), device=cu_seqlens.device, dtype=dtype)
+    mask.masked_fill_(~valid.unsqueeze(1).unsqueeze(1), float("-inf"))
+    return mask.contiguous(), aligned_len
 
 
 def cuda_benchmark(
@@ -284,6 +326,95 @@ def check_allclose(
     return passed, max_abs, max_rel
 
 
+def build_packed_rope_positions(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Build 1D token position indices `[0..L_0-1, 0..L_1-1, ...]` for packed varlen tensors."""
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    if not seqlens:
+        return torch.empty((0,), dtype=torch.int64, device=cu_seqlens.device)
+    chunks = [torch.arange(int(l), device=cu_seqlens.device, dtype=torch.int64) for l in seqlens]
+    return torch.cat(chunks, dim=0)
+
+
+class FlashAttention1VarlenBaseline(nn.Module):
+    """
+    FlashAttention-1 (`flash_attn_unpadded_func`) varlen baseline for SM75 speed comparison.
+    Applies separate PyTorch RoPE + KV head repeat (since FA1 requires H_q == H_kv and has no fused RoPE).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads_q: int,
+        num_heads_kv: int,
+        rope: Optional[nn.Module] = None,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        if not HAS_FLASH_ATTN_1:
+            raise RuntimeError("flash_attn (FlashAttention-1) is not installed.")
+        self.embed_dim = embed_dim
+        self.num_heads_q = num_heads_q
+        self.num_heads_kv = num_heads_kv
+        self.head_dim = embed_dim // num_heads_q
+        self.rep = num_heads_q // num_heads_kv
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.rope = rope
+
+        total_dim = (num_heads_q + 2 * num_heads_kv) * self.head_dim
+        self.qkv_proj = nn.Linear(embed_dim, total_dim, bias=bias)
+        self.out_proj = nn.Linear(num_heads_q * self.head_dim, embed_dim, bias=bias)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(
+        self,
+        x_packed: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: Optional[int] = None,
+        is_causal: bool = False,
+        pos_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        total_l = x_packed.shape[0]
+        qkv = self.qkv_proj(x_packed).view(total_l, self.num_heads_q + 2 * self.num_heads_kv, self.head_dim)
+        q, k, v = qkv.split([self.num_heads_q, self.num_heads_kv, self.num_heads_kv], dim=1)
+
+        if self.rope is not None:
+            if pos_ids is None:
+                pos_ids = build_packed_rope_positions(cu_seqlens_q)
+            cos, sin = self.rope.get_cos_sin(device=x_packed.device, dtype=x_packed.dtype)
+            cos_t = cos.index_select(0, pos_ids).unsqueeze(1)
+            sin_t = sin.index_select(0, pos_ids).unsqueeze(1)
+            q = (q * cos_t) + (self._rotate_half(q) * sin_t)
+            k = (k * cos_t) + (self._rotate_half(k) * sin_t)
+
+        if self.rep > 1:
+            k = k.unsqueeze(2).expand(total_l, self.num_heads_kv, self.rep, self.head_dim).reshape(
+                total_l, self.num_heads_q, self.head_dim
+            )
+            v = v.unsqueeze(2).expand(total_l, self.num_heads_kv, self.rep, self.head_dim).reshape(
+                total_l, self.num_heads_q, self.head_dim
+            )
+
+        eff_max_k = max_seqlen_k if max_seqlen_k is not None else max_seqlen_q
+        out = _fa1_unpadded_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_q,
+            max_seqlen_q,
+            eff_max_k,
+            0.0,
+            softmax_scale=self.scale,
+            causal=is_causal,
+        )
+        return self.out_proj(out.reshape(total_l, -1))
+
+
 def format_markdown_table(
     headers: Sequence[str],
     rows: Iterable[Sequence[Any]],
@@ -312,6 +443,11 @@ __all__ = [
     "pack_varlen_tensor",
     "unpack_varlen_tensor",
     "build_padding_mask",
+    "align_up",
+    "build_additive_padding_mask",
+    "build_packed_rope_positions",
+    "HAS_FLASH_ATTN_1",
+    "FlashAttention1VarlenBaseline",
     "cuda_benchmark",
     "measure_peak_memory_mb",
     "compute_attention_flops",
