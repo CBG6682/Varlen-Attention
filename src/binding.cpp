@@ -3,16 +3,16 @@
 #include "mha_ops.cuh"
 
 // =========================================================================================
-// 1. Đăng ký PyTorch Dispatcher (TORCH_LIBRARY)
-// Hỗ trợ torch.compile / TorchInductor không bị graph break
+// 1. PyTorch Dispatcher Registration (TORCH_LIBRARY)
+// Enables torch.compile / TorchInductor without graph breaks
 // =========================================================================================
 
 TORCH_LIBRARY(varlen_transformer, m) {
     // -------------------------------------------------------------------------------------
     // 1. fused_mha_varlen_fwd
     // Outputs (Tensor, Tensor):
-    //   1. o:   (H_q, Total_Lq, 64) [FP16] - Kết quả Attention raw dạng packed
-    //   2. lse: (H_q, Total_Lq)     [FP32] - Log-Sum-Exp dùng cho Backward
+    //   1. o:   (H_q, Total_Lq, 64) [FP16] - Packed attention output
+    //   2. lse: (H_q, Total_Lq)     [FP32] - Log-Sum-Exp for backward pass
     // -------------------------------------------------------------------------------------
     m.def(
         "fused_mha_varlen_fwd("
@@ -40,7 +40,7 @@ TORCH_LIBRARY(varlen_transformer, m) {
     // -------------------------------------------------------------------------------------
     // 3. fused_mha_varlen_decode
     // Output (Tensor):
-    //   1. o: (H_q, B, 64) [FP16] - Kết quả Flash Decoding
+    //   1. o: (H_q, B, 64) [FP16] - Flash Decoding output
     // -------------------------------------------------------------------------------------
     m.def(
         "fused_mha_varlen_decode("
@@ -59,7 +59,7 @@ TORCH_LIBRARY_IMPL(varlen_transformer, CUDA, m) {
 
 // =========================================================================================
 // 2. Python C++ Extension Module (PYBIND11_MODULE)
-// Cho phép gọi trực tiếp qua varlen_transformer._C
+// Direct Python bindings via varlen_transformer._C
 // =========================================================================================
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

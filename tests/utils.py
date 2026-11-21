@@ -200,7 +200,7 @@ def cuda_benchmark(
     """
     l2_buffer: Optional[torch.Tensor] = None
     if clear_l2:
-        # 16 MB buffer lớn hơn dung lượng L2 của T4 (4 MB) để xả cache giữa các lần đo
+        # 16 MB buffer (> 4 MB T4 L2) to flush L2 cache between iterations
         l2_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.int8, device="cuda")
 
     for _ in range(warmup):
@@ -265,7 +265,7 @@ def compute_attention_flops(
         if not is_causal:
             active_pairs += lq_i * lk_i
         else:
-            # Số ô tam giác hợp lệ với mặt nạ causal col <= row
+            # Valid lower-triangular pairs for causal mask (col <= row)
             n_sq = min(lq_i, lk_i)
             tri_pairs = n_sq * (n_sq + 1) // 2
             tail_rows = max(0, lq_i - lk_i)

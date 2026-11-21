@@ -30,23 +30,7 @@ static constexpr float DECODE_VALID_THRESH = -1e29f;
 // PHẦN 1: DEVICE KERNELS (__global__)
 // =================================================================================================
 
-/*
- * Tóm tắt luồng thực thi kernel_fused_mha_varlen_decode_splitk (Không dùng MMA):
- *   Grid = (num_splits, H_q, B) (với USE_SPLITK=false thì num_splits = 1), Block = (128, 1, 1) (4 warps).
- *   Mỗi CTA xử lý 1 phân đoạn token K/V thuộc [split_start, split_end) của cặp (head_q_idx, seq_idx):
- *   - Giai đoạn 1 (Khởi tạo): Đọc biên chuỗi k_start/k_end, chia phạm vi split; nếu split rỗng thì ghi
- *     o_part = 0, lse_part = DECODE_NEG_INF (hoặc O_direct = 0 nếu !USE_SPLITK) và return sớm.
- *     Nạp broadcast q, áp RoPE tại (offset + lk_i - 1) và nhân sm_scale ở FP32; khai báo SMEM (4,224 B)
- *     và Copy Atoms 2-stage Prefetch buffers.
- *   - Giai đoạn 2 (Main Loop - Rule 24A 2-stage Register Prefetch): Duyệt các tile 16 token K/V, nạp xen kẽ
- *     vào s0/s1 bằng uint4 (áp RoPE cho raw K_cache tại vị trí offset + t), tính dot-product FP32 qua
- *     octet_reduce_sum_f32 và cập nhật Online Softmax + tích lũy o_acc (FP32) cục bộ theo từng hàng token.
- *   - Giai đoạn 3 (Epilogue): Ghi rO_acc và (m_local, l_local) xuống SMEM swizzled (Swizzle<3, 2, 4>),
- *     __syncthreads(), gộp 16 hàng về 1 vector theo bố cục 8x16 LayoutLeft bằng octet reduction (FP32):
- *     + Nếu USE_SPLITK=true: ghi gO_part (FP32 uint4) và gLSE_part (lane leader) bằng cute::copy_if.
- *     + Nếu USE_SPLITK=false: ghép cặp octet trên thanh ghi qua __shfl_xor_sync(..., 8), ép kiểu
- *       FP32 -> FP16 và xuất trực tiếp ra gO_direct (FP16 uint4) không qua bộ đệm trung gian hay reduce.
- */
+
 template <
     int HEAD_DIM = 64,
     int NUM_THREADS = 128,
@@ -73,7 +57,7 @@ kernel_fused_mha_varlen_decode_splitk(
     int num_splits,                                   // scalar [int] - Tổng số phân đoạn Split-K
     float sm_scale                                    // scalar [float] - Hệ số scale 1 / sqrt(64)
 ) {
-    // ==================== GIAI ĐOẠN 1: KHỞI TẠO & CẤU HÌNH TENSOR ====================
+    // 1. Initialization & tensor setup
     const int tid = static_cast<int>(threadIdx.x);
     const int split_idx = USE_SPLITK ? static_cast<int>(blockIdx.x) : 0;
     const int head_q_idx = static_cast<int>(blockIdx.y);
@@ -118,7 +102,7 @@ kernel_fused_mha_varlen_decode_splitk(
         make_layout(Shape<_8, _16>{}, LayoutLeft{}),
         make_layout(Shape<_1, _4>{}, LayoutRight{})));
 
-    // Copy Atom 1D ghi LSE_part qua predication leader (Rule 14)
+    // 1D CopyAtom for LSE_part with leader predication
     using TiledCopyStoreLSE = decltype(make_tiled_copy(
         Copy_Atom<UniversalCopy<float>, float>{},
         make_layout(Shape<Int<NUM_THREADS>, _1>{}, LayoutRight{}),
@@ -205,7 +189,7 @@ kernel_fused_mha_varlen_decode_splitk(
 
     const int offset = (HAS_ROPE && offsets_ptr != nullptr) ? offsets_ptr[seq_idx] : 0;
 
-    // Khai báo trước một lần các fragment cho 2-stage Register Prefetch (Rule 23 & 24A)
+    // Predeclare fragments for 2-stage register prefetch
     Tensor gQ_bcast = make_tensor(
         make_gmem_ptr(Q_ptr + (static_cast<int64_t>(head_q_idx) * B + seq_idx) * HEAD_DIM),
         make_shape(Int<TILE_K_TOKENS>{}, Int<HEAD_DIM>{}),
@@ -228,7 +212,7 @@ kernel_fused_mha_varlen_decode_splitk(
     CUTE_STATIC_ASSERT_V(size(rK_s0) == Int<8>{});
     CUTE_STATIC_ASSERT_V(size(rO_acc) == Int<8>{});
 
-    // Nạp broadcast vector q (16 hàng trỏ chung địa chỉ để phần cứng L1/LSU gộp giao dịch - Rule 14)
+    // Broadcast-load q vector (16 rows share address for L1/LSU coalescing)
     cute::copy(tiled_copy_kv, tQgQ, rQ);
     if constexpr (HAS_ROPE) {
         const int64_t q_rope_offset = static_cast<int64_t>(offset + lk_i - 1) * HEAD_DIM;
@@ -264,7 +248,7 @@ kernel_fused_mha_varlen_decode_splitk(
 
     const int64_t kv_head_base = static_cast<int64_t>(head_kv_idx) * Total_Lk * HEAD_DIM;
 
-    // ==================== GIAI ĐOẠN 2: MAIN LOOP (RULE 24A PREFETCH 2 STAGE) ====================
+    // 2. Main loop (2-stage register prefetch)
     clear(rO_acc);
     float m_local = DECODE_NEG_INF;
     float l_local = 0.0f;
@@ -352,7 +336,7 @@ kernel_fused_mha_varlen_decode_splitk(
         }
     };
 
-    // Phát trước 2 stage nạp GMEM đầu tiên trước khi bắt đầu tính toán (Rule 24A)
+    // Issue first 2 GMEM prefetch stages
     load_tile(0, rK_s0, rV_s0, rCos_s0, rSin_s0);
     if (num_tiles > 1) {
         load_tile(1, rK_s1, rV_s1, rCos_s1, rSin_s1);
@@ -374,7 +358,7 @@ kernel_fused_mha_varlen_decode_splitk(
         consume_tile(rK_s0, rV_s0, rCos_s0, rSin_s0, true);
     }
 
-    // ==================== GIAI ĐOẠN 3: EPILOGUE (GỘP 16 HÀNG & XUẤT GMEM) ====================
+    // 3. Epilogue: row reduction & GMEM store
     cute::copy(tiled_copy_f32_16x8, rO_acc, tOsO_W);
     if (col_vec == 0) {
         sM_ptr[row_in_tile] = m_local;
@@ -415,7 +399,7 @@ kernel_fused_mha_varlen_decode_splitk(
                 fmaf(rO_pair(v, 0, 0), w0, rO_pair(v, 1, 0) * w1)) * inv_l;
         }
 
-        // Ghép lane col16 chẵn/lẻ trên cùng warp qua __shfl_xor_sync(..., 8), ép FP16 trên thanh ghi (Rule 17)
+        // Pair even/odd col16 lanes via __shfl_xor_sync(..., 8) and convert to FP16 in registers
         CUTE_UNROLL
         for (int v = 0; v < 4; ++v) {
             const float partner_v = __shfl_xor_sync(0xffffffff, o_final[v], 8);
@@ -426,15 +410,7 @@ kernel_fused_mha_varlen_decode_splitk(
     }
 }
 
-/*
- * Tóm tắt luồng thực thi kernel_fused_mha_varlen_decode_reduce (Không SMEM, không __syncthreads):
- *   Grid = (H_q, B, 1), Block = (128, 1, 1) (8x16 LayoutLeft: mỗi octet giảm trục splits cho 4 phần tử head).
- *   - Bước 1: Quét gLSE_part tìm lse_max chung qua octet_reduce_max_f32.
- *   - Bước 2: Dùng 2-stage Register Prefetch (Rule 24A) nạp gO_part theo từng tile SPLIT_TILE = 8,
- *     tích lũy Z_local và o_acc[4] với trọng số exp(lse_s - lse_max) ở FP32.
- *   - Bước 3: Giảm trên octet để lấy o_norm[4], ghép cặp 4+4 = 8 phần tử qua __shfl_xor_sync(..., 8),
- *     ép FP32 -> FP16 trên thanh ghi và ghi ra gO bằng 128-bit copy_if (8 lane dẫn đầu).
- */
+
 template <
     int HEAD_DIM = 64,
     int NUM_THREADS = 128,
@@ -470,7 +446,7 @@ kernel_fused_mha_varlen_decode_reduce(
     TiledCopyStoreO_FP16 tiled_copy_store_fp16;
     auto thr_copy_store_fp16 = tiled_copy_store_fp16.get_thread_slice(tid);
 
-    // Khai báo tensor đầu ra & fragment prefetch cố định một lần (Rule 23)
+    // Output tensor & prefetch fragments
     const int64_t head_seq_idx = static_cast<int64_t>(head_q_idx) * B + seq_idx;
     const float* lse_part_base = LSE_part_ptr + head_seq_idx * num_splits;
     const float* o_part_base = O_part_ptr + head_seq_idx * num_splits * HEAD_DIM;
@@ -507,7 +483,7 @@ kernel_fused_mha_varlen_decode_reduce(
     }
     const float lse_max = octet_reduce_max_f32(lse_max_local);
 
-    // 2. Tích lũy chuẩn hóa qua 2-stage Register Prefetch (Rule 24A)
+    // 2. Normalized accumulation via 2-stage register prefetch
     float Z_local = 0.0f;
     float o_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -588,19 +564,7 @@ kernel_fused_mha_varlen_decode_reduce(
 // PHẦN 2: HOST FUNCTION
 // =================================================================================================
 
-/*
- * Tóm tắt hàm Host fused_mha_varlen_decode:
- *   - Bước 1 (Kiểm tra đầu vào): Xác thực CUDA device, contiguous, dtype (FP16 cho q/k_cache/v_cache/cos/sin,
- *     Int32 cho cu_seqlens_k/offsets), số chiều, head_dim == 64 và tỷ lệ GQA H_q % H_kv == 0.
- *   - Bước 2 (Adaptive Dispatch theo SM, occupancy & độ lớn dữ liệu KV):
- *     + Lấy sm_count và max_blocks_per_sm qua CUDA API; tính target_splits = (sm_count * max_blocks_per_sm) / (B * H_q).
- *     + Khi use_splitk được chỉ định rõ: ép theo giá trị đó. Khi std::nullopt (Auto Dispatch): chỉ bật Split-K
- *       nếu GPU còn thiếu block (target_splits >= 2), độ dài cho phép chia (>= 2 splits) và max_seqlen_k > 256.
- *     + Nếu !run_splitk: không cấp phát o_part/lse_part, chạy 1 kernel duy nhất (USE_SPLITK=false) xuất trực tiếp FP16.
- *     + Nếu run_splitk: chạy kernel_fused_mha_varlen_decode_splitk (USE_SPLITK=true) rồi reduce ở FP32 -> FP16.
- *   - Bước 3 (Hoàn tất): Trả về tensor:
- *       + o: (H_q, B, 64) [FP16]
- */
+
 at::Tensor fused_mha_varlen_decode(
     const at::Tensor& q,                              // (H_q, B, 64) [FP16] - Query decode hiện tại
     const at::Tensor& k_cache,                        // (H_kv, Total_Lk, 64) [FP16] - Raw Key cache packed
@@ -818,7 +782,7 @@ at::Tensor fused_mha_varlen_decode(
             num_splits);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        // Giải phóng bộ đệm trung gian Split-K (Rule 5 - Bước 8)
+        // Release temporary Split-K buffers
         o_part = at::Tensor();
         lse_part = at::Tensor();
     }

@@ -8,7 +8,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Giới hạn số luồng biên dịch song song để tránh tràn RAM trên Colab/Kaggle
+# Limit parallel compilation jobs to avoid OOM on Colab/Kaggle
 if "MAX_JOBS" not in os.environ:
     os.environ["MAX_JOBS"] = "2"
     print(f"[setup.py] Setting default MAX_JOBS={os.environ['MAX_JOBS']} to prevent CPU/RAM exhaustion")

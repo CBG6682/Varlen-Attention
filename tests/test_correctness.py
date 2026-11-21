@@ -134,7 +134,7 @@ def test_varlen_fwd_bwd_kernels(quick: bool = False, device: Optional[torch.devi
         all_passed &= check_allclose(f"{name}.raw_vs_auto_dk", dk_raw, k.grad, atol=1e-4, rtol=1e-4)[0]
         all_passed &= check_allclose(f"{name}.raw_vs_auto_dv", dv_raw, v.grad, atol=1e-4, rtol=1e-4)[0]
 
-    # Edge cases: chuỗi rỗng lồng trong batch + batch rỗng
+    # Edge cases: empty sequences inside a batch and an empty batch
     print("\n-- Case [edge_zero_len_and_empty_batch] --")
     cu_q_edge, max_q_edge = _make_cu_seqlens([0, 17, 0, 65], dev)
     cu_k_edge, max_k_edge = _make_cu_seqlens([0, 17, 0, 65], dev)

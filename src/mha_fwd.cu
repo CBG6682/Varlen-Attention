@@ -25,28 +25,7 @@
 
 using namespace cute;
 
-// =========================================================================================
-// PHẦN 1: GLOBAL KERNEL (kernel_fused_mha_varlen_fwd)
-// =========================================================================================
-// Tóm tắt Flow thực thi:
-//   - Khởi tạo (Rule 6, 13, 14, 23): Xác định (block_q_idx, head_q_idx, seq_idx), đọc biên
-//     cu_seqlens_q/k và offsets[seq_idx]; khai báo 1 lần toàn bộ tensor GMEM, SMEM (16 KB chia
-//     sBuf0 8 KB + sBuf1 8 KB gắn Swizzle<3, 3, 3>), tensor phân mảnh, predication (tQpQ, tKpK,
-//     tLpLSE) và cặp thanh ghi dùng chung (tCrA, tCrB) cho MMA.
-//   - Prologue: Nạp block Q (g2r 128-bit) + áp dụng RoPE thuận trên thanh ghi (nếu HAS_ROPE),
-//     ghi vào sBuf0 (r2s uint4), nạp qua LDSM_N vào tCrQ và giữ cố định suốt vòng đời kernel;
-//     sau đó prefetch K_0 (+ RoPE) vào sBuf0.
-//   - Main Loop (dừng sớm khi IS_CAUSAL && block_k > block_q):
-//     + Pha 1: Prefetch V_curr (g2r) song song với LDSM_N nạp K từ sBuf0 và gemm S = Q @ K^T,
-//       ghi V_curr xuống sBuf1 (r2s) và __syncthreads().
-//     + Pha 2: Nhân scale, áp dụng Causal Mask & chặn biên lk_i, tính Online Softmax (FP32,
-//       quad_reduce_max/sum), rescale tCrO, rồi chuyển tiếp trực tiếp P từ tCrS sang tCrA
-//       trên thanh ghi (Rule 19 - Lựa chọn 1B, không qua SMEM và không cần __syncthreads()).
-//     + Pha 3: Prefetch K_next (g2r + RoPE) song song với LDSM_T nạp V chuyển vị từ sBuf1 và
-//       gemm O += P @ V; ghi K_next vào sBuf0 (đã rảnh từ cuối Pha 1) và __syncthreads().
-//   - Epilogue: Chuẩn hóa tCrO /= l_i, ghi gLSE qua cute::copy_if (lane leader predication),
-//     ép kiểu tCrO -> FP16 staging qua sBuf1 (Swizzle) rồi dùng TiledCopy 128-bit ghi ra gO.
-// =========================================================================================
+// Varlen FlashAttention + Fused RoPE Forward kernel (SM75 64x64x64).
 
 template <
     typename Element,
@@ -71,9 +50,9 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     const Element* __restrict__ gV_ptr,          // shape: (H_kv, Total_Lk, 64), dtype: FP16
     const int32_t* __restrict__ cu_seqlens_q,    // shape: (B + 1,), dtype: int32
     const int32_t* __restrict__ cu_seqlens_k,    // shape: (B + 1,), dtype: int32
-    const Element* __restrict__ gCos_ptr,        // shape: (L_max, 64), dtype: FP16 (nullptr nếu !HAS_ROPE)
-    const Element* __restrict__ gSin_ptr,        // shape: (L_max, 64), dtype: FP16 (nullptr nếu !HAS_ROPE)
-    const int32_t* __restrict__ offsets_ptr,     // shape: (B,), dtype: int32 (nullptr nếu offset = 0)
+    const Element* __restrict__ gCos_ptr,        // shape: (L_max, 64), dtype: FP16 (nullptr if !HAS_ROPE)
+    const Element* __restrict__ gSin_ptr,        // shape: (L_max, 64), dtype: FP16 (nullptr if !HAS_ROPE)
+    const int32_t* __restrict__ offsets_ptr,     // shape: (B,), dtype: int32 (nullptr if offset == 0)
     Element*       __restrict__ gO_ptr,          // shape: (H_q, Total_Lq, 64), dtype: FP16
     float*         __restrict__ gLSE_ptr,        // shape: (H_q, Total_Lq), dtype: FP32
     int64_t total_lq,                            // scalar: int64
@@ -84,7 +63,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     float scale                                  // scalar: float (1 / sqrt(64) = 0.125)
 ) {
     // -------------------------------------------------------------------------------------
-    // Giai đoạn 1: Tính toán Khởi tạo & Đọc biên Varlen (Rule 6, 13, 14)
+    // 1. Varlen sequence bounds & coordinates
     // -------------------------------------------------------------------------------------
     const int block_q_idx = static_cast<int>(blockIdx.x);
     const int head_q_idx  = static_cast<int>(blockIdx.y);
@@ -93,7 +72,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     const int rep         = H_q / H_kv;
     const int head_kv_idx = head_q_idx / rep;
 
-    // Đọc biên chuỗi và offset trực tiếp từ con trỏ GMEM (Rule 14)
+    // Read sequence bounds and RoPE offset
     const int q_start    = cu_seqlens_q[seq_idx];
     const int q_end      = cu_seqlens_q[seq_idx + 1];
     const int lq_i       = q_end - q_start;
@@ -121,7 +100,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     const int  col_vec_idx    = tid % (TILE_K / 8);
     const bool is_second_half = (col_vec_idx >= 4);
 
-    // Dịch con trỏ cơ sở tới vị trí (head, seq_start) tương ứng
+    // Offset base pointers to (head, seq_start)
     const Element* q_base_ptr   = gQ_ptr   + (static_cast<int64_t>(head_q_idx) * total_lq + q_start) * TILE_K;
     const Element* k_base_ptr   = gK_ptr   + (static_cast<int64_t>(head_kv_idx) * total_lk + k_start) * TILE_K;
     const Element* v_base_ptr   = gV_ptr   + (static_cast<int64_t>(head_kv_idx) * total_lk + k_start) * TILE_K;
@@ -133,9 +112,9 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     const int64_t  cos_rows     = HAS_ROPE ? (l_max - static_cast<int64_t>(seq_offset)) : 0;
 
     // -------------------------------------------------------------------------------------
-    // Giai đoạn 2: Khai báo & Phân mảnh Tensor 1 lần duy nhất ở đầu Kernel (Rule 6, 23)
+    // 2. Tensor & SMEM partitioning
     // -------------------------------------------------------------------------------------
-    // Phân bổ 16 KB SMEM động thành 2 buffer 8 KB (sBuf0 cho Q/K, sBuf1 cho V/O)
+    // 16 KB dynamic SMEM split into two 8 KB buffers (sBuf0: Q/K, sBuf1: V/O)
     extern __shared__ __align__(16) uint8_t smem_raw[];
     Element* sBuf0_ptr = reinterpret_cast<Element*>(smem_raw);
     Element* sBuf1_ptr = reinterpret_cast<Element*>(smem_raw + TILE_M * TILE_K * sizeof(Element));
@@ -144,7 +123,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     Tensor sBuf1      = make_tensor(make_smem_ptr(sBuf1_ptr), SmemLayoutKMajor{});
     Tensor sBuf1_V_mn = make_tensor(make_smem_ptr(sBuf1_ptr), SmemLayoutMNMajor{});
 
-    // Tensor GMEM dạng packed cho chuỗi hiện tại
+    // Packed GMEM tensors for current sequence
     Tensor mQ   = make_tensor(make_gmem_ptr(q_base_ptr),  make_shape(lq_i, Int<TILE_K>{}),     make_stride(Int<TILE_K>{}, Int<1>{}));
     Tensor mK   = make_tensor(make_gmem_ptr(k_base_ptr),  make_shape(lk_i, Int<TILE_K>{}),     make_stride(Int<TILE_K>{}, Int<1>{}));
     Tensor mV   = make_tensor(make_gmem_ptr(v_base_ptr),  make_shape(lk_i, Int<TILE_K>{}),     make_stride(Int<TILE_K>{}, Int<1>{}));
@@ -152,7 +131,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     Tensor mCos = make_tensor(make_gmem_ptr(cos_seq_ptr), make_shape(cos_rows, Int<TILE_K>{}), make_stride(Int<TILE_K>{}, Int<1>{}));
     Tensor mSin = make_tensor(make_gmem_ptr(sin_seq_ptr), make_shape(cos_rows, Int<TILE_K>{}), make_stride(Int<TILE_K>{}, Int<1>{}));
 
-    // Cắt tile Q và O cho block hiện tại
+    // Slice Q and O tiles for current block
     Tensor gQ = local_tile(mQ, make_tile(Int<TILE_M>{}, Int<TILE_K>{}), make_coord(block_q_idx, 0));
     Tensor gO = local_tile(mO, make_tile(Int<TILE_M>{}, Int<TILE_K>{}), make_coord(block_q_idx, 0));
 
@@ -176,7 +155,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     Tensor rCos   = make_tensor(make_rmem_ptr(buf_cos),   frag_layout);
     Tensor rSin   = make_tensor(make_rmem_ptr(buf_sin),   frag_layout);
 
-    // Tính toán Predication chặn biên 1 lần duy nhất trước vòng lặp (Rule 13)
+    // Precompute boundary predication
     Tensor cTile = make_identity_tensor(make_shape(Int<TILE_M>{}, Int<TILE_K>{}));
     Tensor tQcQ  = thr_copy_g2r.partition_S(cTile);
     Tensor tQpQ  = make_tensor<bool>(shape(tQgQ));
@@ -208,7 +187,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         }
     }
 
-    // Khai báo tensor và predication ghi gLSE cho lane leader (Rule 14, 18)
+    // LSE output tensor and lane-leader predication
     Tensor tLgLSE = make_tensor(
         make_gmem_ptr(lse_head_ptr + q_start_row + warp_id * 16 + quad_id),
         make_shape(Int<1>{}, Int<2>{}),
@@ -219,7 +198,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     tLpLSE(0, 0) = (lane_in_quad == 0) && (global_row_a < lq_i);
     tLpLSE(0, 1) = (lane_in_quad == 0) && (global_row_b < lq_i);
 
-    // Khai báo TiledMMA, S2R Copy Atoms và Fragment (Rule 19: đúng 1 cặp dùng chung tCrA, tCrB)
+    // TiledMMA, S2R copy atoms, and shared operand fragments
     TiledMMAType tiled_mma;
     auto thr_mma = tiled_mma.get_slice(tid);
 
@@ -246,7 +225,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     auto tCrB_mn_view  = thr_s2r_b_mn.retile_D(tCrB);
 
     // -------------------------------------------------------------------------------------
-    // Giai đoạn 3: Khởi tạo Accumulator, Online Softmax & Helper Lambdas (Rule 6, 22)
+    // 3. Accumulators, Online Softmax state & RoPE/copy helpers
     // -------------------------------------------------------------------------------------
     Tensor tCrO = thr_mma.partition_fragment_C(sBuf1);
     Tensor tCrS = thr_mma.partition_fragment_C(sBuf1);
@@ -270,7 +249,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         }
     };
 
-    // Lambda r2s: Ghi trực tiếp 128-bit uint4 qua phân vùng Swizzled SMEM (Rule 24B)
+    // Write 128-bit uint4 registers to swizzled SMEM
     auto r2s_store = [](auto const& rSrc, auto& tSmemD) {
         #pragma unroll
         for (int m = 0; m < size<1>(rSrc); ++m) {
@@ -339,7 +318,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         Tensor gV_curr = local_tile(mV, make_tile(Int<TILE_N>{}, Int<TILE_K>{}), make_coord(k_tile, 0));
         g2r_load(thr_copy_g2r.partition_S(gV_curr), rStage, tKpK, curr_k_in_bounds);
 
-        // Nạp trọn vẹn K từ sBuf0 vào tCrB (Rule 24B) rồi thực hiện GEMM S = Q @ K^T
+        // Load K from sBuf0 into tCrB and compute S = Q @ K^T
         cute::copy(s2r_copy_b_km, tBsBuf0_s2r, tCrB_km_view);
         cute::clear(tCrS);
         cute::gemm(tiled_mma, tCrQ, tCrB, tCrS);
@@ -348,7 +327,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         r2s_store(rStage, tVsBuf1);
         __syncthreads();
 
-        // --- Pha 2: Scale, Causal Mask, Online Softmax & Chuyển tiếp trực tiếp P -> tCrA (Rule 19) ---
+        // Scale, causal mask, Online Softmax & direct register P -> tCrA
         float m_new_a = m_old_a;
         float m_new_b = m_old_b;
 
@@ -400,7 +379,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
             row_sum_a += p_a0 + p_a1;
             row_sum_b += p_b0 + p_b1;
 
-            // Rule 19 (Lựa chọn 1B): Chuyển tiếp trực tiếp tCrS -> tCrA trên thanh ghi (0 SMEM, 0 sync)
+            // Direct register transfer tCrS -> tCrA (no SMEM, no sync)
             tCrA(0, 0, n) = float_to_out<Element>(p_a0);
             tCrA(1, 0, n) = float_to_out<Element>(p_a1);
             tCrA(2, 0, n) = float_to_out<Element>(p_b0);
@@ -429,7 +408,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
             }
         }
 
-        // Nạp V chuyển vị bằng LDSM_T từ sBuf1 vào tCrB (Rule 16, 24B) rồi tính O += P @ V
+        // Load transposed V via LDSM_T from sBuf1 into tCrB and compute O += P @ V
         cute::copy(s2r_copy_b_mn, tBsBuf1_s2r, tCrB_mn_view);
         cute::gemm(tiled_mma, tCrA, tCrB, tCrO);
 
@@ -444,7 +423,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     }
 
     // -------------------------------------------------------------------------------------
-    // Bước 4 (Epilogue): Chuẩn hóa O, ghi gLSE và Staging O qua sBuf1 -> gO (Rule 14, 17, 18)
+    // 4. Epilogue: normalize O, store LSE, stage O via sBuf1 -> gO
     // -------------------------------------------------------------------------------------
     const float inv_l_a = (l_old_a > 0.0f && m_old_a != NEG_INF) ? __fdividef(1.0f, l_old_a) : 0.0f;
     const float inv_l_b = (l_old_b > 0.0f && m_old_b != NEG_INF) ? __fdividef(1.0f, l_old_b) : 0.0f;
@@ -457,12 +436,12 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         tCrO(3, 0, n) *= inv_l_b;
     }
 
-    // Ghi LSE (FP32) ra GMEM bằng CopyAtom với lane leader predication (Rule 14, 18)
+    // Store FP32 LSE with lane-leader predication
     tLrLSE(0, 0) = (l_old_a > 0.0f && m_old_a != NEG_INF) ? (m_old_a + __logf(l_old_a)) : NEG_INF;
     tLrLSE(0, 1) = (l_old_b > 0.0f && m_old_b != NEG_INF) ? (m_old_b + __logf(l_old_b)) : NEG_INF;
     cute::copy_if(CopyAtomLSE{}, tLpLSE, tLrLSE, tLgLSE);
 
-    // Quy trình 2 bước (Rule 17, 18): Ép kiểu sang fragment đệm FP16 -> R2S vào sBuf1 có Swizzle
+    // Convert FP32 accumulator to FP16 -> R2S into swizzled sBuf1 -> 128-bit S2G
     Tensor rO_fp16 = make_tensor<Element>(shape(tCrO));
     #pragma unroll
     for (int i = 0; i < size(tCrO); ++i) {
@@ -479,21 +458,7 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     }
 }
 
-// =========================================================================================
-// PHẦN 2: HOST FUNCTION (fused_mha_varlen_fwd)
-// =========================================================================================
-// Tóm tắt Flow thực thi:
-//   - Giai đoạn 1 (Torch Check): Kiểm tra thiết bị CUDA, tính liên tục, kiểu dữ liệu,
-//     số chiều, ràng buộc head_dim = 64 và H_q % H_kv == 0 (cũng như cos/sin/offsets nếu có).
-//   - Giai đoạn 2 (Launch Procedure 8 bước): Cấp phát trước o (FP16) và lse (FP32);
-//     khai báo hằng số template (TILE 64x64x64, 128 threads, 16 KB SMEM), Layout SMEM gắn
-//     Swizzle<3, 3, 3>, Copy Atom 128-bit & LDSM, TiledMMA Shape<_4, _1, _1>; lấy CUDA stream
-//     và launch kernel trong khối scope { ... } riêng biệt theo <HAS_ROPE, IS_CAUSAL>.
-//   - Giai đoạn 3 (Return): Trả về tuple (o, lse).
-// Shapes & Dtypes trả về:
-//   1. o:   (H_q, Total_Lq, 64) [FP16] - Kết quả Attention raw dạng packed
-//   2. lse: (H_q, Total_Lq)     [FP32] - Log-Sum-Exp dùng cho Backward
-// =========================================================================================
+// Host wrapper for fused_mha_varlen_fwd.
 
 std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     const at::Tensor& q,                                     // (H_q, Total_Lq, 64) [FP16]
@@ -508,7 +473,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     const std::optional<at::Tensor>& offsets                 // (B,) [Int32] (optional)
 ) {
     // -------------------------------------------------------------------------------------
-    // Giai đoạn 1: Xác thực Dữ liệu (Torch Check - Rule 5)
+    // 1. Input validation
     // -------------------------------------------------------------------------------------
     at::cuda::CUDAGuard device_guard(q.device());
 
@@ -570,7 +535,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     }
 
     // -------------------------------------------------------------------------------------
-    // Giai đoạn 2: Quy trình Khởi chạy Kernel 8 bước (Rule 5, 8, 10, 11, 15, 16)
+    // 2. Kernel launch setup
     // -------------------------------------------------------------------------------------
     // Bước 1: Xử lý trường hợp biên rỗng và cấp phát trước tensor output o (FP16), lse (FP32)
     if (Total_Lq == 0 || max_seqlen_q <= 0 || B <= 0) {
@@ -600,7 +565,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     );
     dim3 block(NUM_THREADS, 1, 1);
 
-    // Bước 3: Khai báo Layout SMEM gắn Swizzle<3, 3, 3> (Rule 15, 16)
+    // Swizzled SMEM layouts
     using SmemLayoutKMajor = decltype(composition(
         Swizzle<3, 3, 3>{},
         make_layout(make_shape(Int<TILE_M>{}, Int<TILE_K>{}), make_stride(Int<TILE_K>{}, Int<1>{}))
@@ -610,7 +575,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
         make_layout(make_shape(Int<TILE_K>{}, Int<TILE_N>{}), make_stride(Int<1>{}, Int<TILE_K>{}))
     ));
 
-    // Bước 4: Khai báo Copy Atom G2R/S2G 128-bit, LSE Copy Atom và LDSM S2R (Rule 12, 16, 24B)
+    // 128-bit G2R/S2G, LSE, and LDSM S2R copy atoms
     using CopyAtomG2R = Copy_Atom<UniversalCopy<uint4>, Element>;
     using TiledCopyG2R = decltype(make_tiled_copy(
         CopyAtomG2R{},
@@ -623,7 +588,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     using S2RCopyAtomB_KMajor  = Copy_Atom<SM75_U32x1_LDSM_N, Element>;
     using S2RCopyAtomB_MNMajor = Copy_Atom<SM75_U16x2_LDSM_T, Element>;
 
-    // Bước 5: Khai báo MMA Atom & TiledMMA Shape<_4, _1, _1> (Rule 15, 19 - Lựa chọn 1B)
+    // SM75 16x8x8 TiledMMA (4x1x1)
     using MMAAtom      = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
     using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_4, _1, _1>, Stride<_1, _4, _4>>>;
 
@@ -641,7 +606,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     Element*       o_ptr       = reinterpret_cast<Element*>(o.data_ptr<at::Half>());
     float*         lse_ptr     = lse.data_ptr<float>();
 
-    // Bước 7: Cô lập Launch Kernel trong khối scope riêng biệt (Rule 8, 10)
+    // Launch kernel
     {
         auto launch_fwd = [&](auto has_rope_tag, auto is_causal_tag) {
             constexpr bool kHasRope  = decltype(has_rope_tag)::value;
@@ -702,7 +667,7 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     // Bước 8: Không có tensor trung gian cần giải phóng
 
     // -------------------------------------------------------------------------------------
-    // Giai đoạn 3: Trả về Kết quả (Rule 5)
+    // 3. Return outputs
     // -------------------------------------------------------------------------------------
     return std::make_tuple(o, lse);
 }

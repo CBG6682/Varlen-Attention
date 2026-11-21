@@ -29,109 +29,7 @@ using namespace cute;
 // PHẦN 1: DEVICE KERNEL (__global__) VÀ HELPERS
 // =================================================================================================
 
-/** Áp dụng RoPE Forward trực tiếp trên fragment thanh ghi (32x8 threads, 8 halfs/bước). */
-template <int TILE_K, typename FragFP16>
-__device__ __forceinline__ void apply_rope_fwd_32x8(
-    FragFP16& rTile,                              // ((1,8), 2, 1) [FP16] - Fragment thanh ghi cần xoay
-    const cutlass::half_t* __restrict__ cos_ptr,  // (L_max, 64) [FP16] - Bảng cos RoPE
-    const cutlass::half_t* __restrict__ sin_ptr,  // (L_max, 64) [FP16] - Bảng sin RoPE
-    int tile_start_pos,                           // scalar [int] - Vị trí bắt đầu tile theo chuỗi
-    int offset,                                   // scalar [int] - Offset RoPE của chuỗi
-    int valid_rows,                               // scalar [int] - Số hàng hợp lệ còn lại
-    int row_m0_g2r,                               // scalar [int] - Hàng bước m=0
-    int row_m1_g2r,                               // scalar [int] - Hàng bước m=1
-    int col_vec_g2r,                              // scalar [int] - Chỉ số nhóm 8 cột (0..7)
-    bool is_second_half_g2r                       // scalar [bool] - Thuộc nửa sau [32..63]
-) {
-    CUTE_UNROLL
-    for (int m = 0; m < size<1>(rTile); ++m) {
-        const int row_in_tile = (m == 0) ? row_m0_g2r : row_m1_g2r;
-        const bool valid_row = (row_in_tile < valid_rows);
-        const int rope_pos = valid_row ? (offset + tile_start_pos + row_in_tile) : 0;
-        const __half2* cos_h2 = reinterpret_cast<const __half2*>(
-            cos_ptr + rope_pos * TILE_K + col_vec_g2r * 8);
-        const __half2* sin_h2 = reinterpret_cast<const __half2*>(
-            sin_ptr + rope_pos * TILE_K + col_vec_g2r * 8);
-        apply_rope_fwd_8elem_shfl(&rTile(0, m, 0), cos_h2, sin_h2, is_second_half_g2r);
-        if (!valid_row) {
-            clear(rTile(_, m, 0));
-        }
-    }
-}
 
-/** Áp dụng RoPE Backward tại chỗ trên fragment FP32 (16x16 threads, 4 floats/bước). */
-template <int TILE_K, typename FragF32>
-__device__ __forceinline__ void apply_rope_bwd_f32_16x16(
-    FragF32& rF32,                                // ((1,4), 4, 1) [FP32] - Gradient trước RoPE (tại chỗ)
-    const cutlass::half_t* __restrict__ cos_ptr,  // (L_max, 64) [FP16] - Bảng cos RoPE
-    const cutlass::half_t* __restrict__ sin_ptr,  // (L_max, 64) [FP16] - Bảng sin RoPE
-    int tile_start_pos,                           // scalar [int] - Vị trí bắt đầu tile theo chuỗi
-    int offset,                                   // scalar [int] - Offset RoPE của chuỗi
-    int valid_rows,                               // scalar [int] - Số hàng hợp lệ còn lại
-    int row_in_step_f32,                          // scalar [int] - Hàng trong nhóm 16 (tid >> 4)
-    int col_vec_f32,                              // scalar [int] - Chỉ số nhóm 4 cột (tid & 15)
-    bool is_second_half_f32                       // scalar [bool] - Thuộc nửa sau [32..63]
-) {
-    CUTE_UNROLL
-    for (int m = 0; m < size<1>(rF32); ++m) {
-        const int row_in_tile = m * 16 + row_in_step_f32;
-        const bool valid_row = (row_in_tile < valid_rows);
-        const int rope_pos = valid_row ? (offset + tile_start_pos + row_in_tile) : 0;
-        const __half2* cos_h2 = reinterpret_cast<const __half2*>(
-            cos_ptr + rope_pos * TILE_K + col_vec_f32 * 4);
-        const __half2* sin_h2 = reinterpret_cast<const __half2*>(
-            sin_ptr + rope_pos * TILE_K + col_vec_f32 * 4);
-
-        float c_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float s_arr[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (valid_row) {
-            const __half2 c01 = cos_h2[0];
-            const __half2 c23 = cos_h2[1];
-            const __half2 s01 = sin_h2[0];
-            const __half2 s23 = sin_h2[1];
-            c_arr[0] = __low2float(c01);
-            c_arr[1] = __high2float(c01);
-            c_arr[2] = __low2float(c23);
-            c_arr[3] = __high2float(c23);
-            s_arr[0] = __low2float(s01);
-            s_arr[1] = __high2float(s01);
-            s_arr[2] = __low2float(s23);
-            s_arr[3] = __high2float(s23);
-        }
-
-        // Tất cả thread trong warp cùng thực hiện __shfl_xor_sync trước khi kiểm tra valid_row
-        CUTE_UNROLL
-        for (int v = 0; v < size<0>(rF32); ++v) {
-            const float g_val = rF32(v, m, 0);
-            const float partner_g = __shfl_xor_sync(0xffffffff, g_val, 8);
-            if (valid_row) {
-                rF32(v, m, 0) = is_second_half_f32
-                    ? fmaf(g_val, c_arr[v], -partner_g * s_arr[v])
-                    : fmaf(g_val, c_arr[v], partner_g * s_arr[v]);
-            }
-        }
-    }
-}
-
-/*
- * Tóm tắt luồng thực thi kernel_fused_mha_varlen_bwd:
- *   Grid = (cdiv(max_seqlen_k, 64), B, H_kv), Block = (256, 1, 1) (8 warps).
- *   Mỗi CTA phụ trách 1 tile K/V kích thước (64 x 64) tại (batch_idx, h_kv, block_k_idx):
- *   - Giai đoạn 1 (Khởi tạo): Đọc varlen metadata (cu_seqlens_q/k, offsets), kiểm tra biên sớm,
- *     khởi tạo SMEM views (57,600 bytes), Copy Atoms, MMA và toàn bộ register/predicate tensors.
- *   - Giai đoạn 2 (Prologue): Tải K, V từ GMEM bằng 128-bit copy; áp dụng RoPE Forward lên K một lần
- *     trên thanh ghi rồi lưu K_rot, V vào SMEM; reset tCrDK, tCrDV về 0.
- *   - Giai đoạn 3 (Main Loop theo nhóm GQA h_q và block_q_idx):
- *       3.1 Tải Q (áp RoPE Forward), dO, O từ GMEM; tính D = rowsum(dO * O) vào sD_ptr[64].
- *       3.2 GEMM 1: S = Q @ K^T -> P = exp(scale * S - LSE) (che Causal/padding) -> lưu sP.
- *       3.3 GEMM 2: dV += P^T @ dO (đọc sP_mn, sDO_mn bằng LDSM_T, cộng dồn FP32 vào tCrDV).
- *       3.4 GEMM 3: dP = dO @ V^T -> dS_unscaled = P * (dP - D) -> lưu sdS.
- *       3.5 GEMM 4: dK += dS^T @ Q (đọc sdS_mn, sQ_mn bằng LDSM_T, cộng dồn FP32 vào tCrDK).
- *       3.6 GEMM 5: dQ_local = dS @ K -> nhân sm_scale -> stage FP32 vào sStaging_fp32 ([32KB..48KB)),
- *           tải về rF32 bằng TiledCopyF32, áp dụng RoPE Backward trên thanh ghi -> atomicAdd vào dQ_fp32.
- *   - Giai đoạn 4 (Epilogue): Chuyển tCrDV -> FP16 qua sStaging -> xuất GMEM (128-bit);
- *     nhân sm_scale lên tCrDK, áp dụng RoPE Backward qua sStaging_fp32 (nếu HAS_ROPE) -> xuất GMEM (128-bit).
- */
 template <
     int TILE_M = 64,
     int TILE_N = 64,
@@ -162,7 +60,7 @@ kernel_fused_mha_varlen_bwd(
     int Total_Lk,                                 // scalar [int] - Tổng số token Key/Value
     float sm_scale                                // scalar [float] - Hệ số scale 1 / sqrt(64)
 ) {
-    // ==================== GIAI ĐOẠN 1: KHỞI TẠO TỌA ĐỘ, SMEM & TENSOR ====================
+    // 1. Coordinates, SMEM & tensor partitioning
     const int tid = static_cast<int>(threadIdx.x);
     const int block_k_idx = static_cast<int>(blockIdx.x);
     const int batch_idx = static_cast<int>(blockIdx.y);
@@ -356,7 +254,7 @@ kernel_fused_mha_varlen_bwd(
     const int mma_row_a = get<0>(cC(0, 0, 0));
     const int mma_row_b = get<0>(cC(2, 0, 0));
 
-    // ==================== GIAI ĐOẠN 2: PROLOGUE (TẢI K, V VÀ ROPE CHO K) ====================
+    // 2. Prologue: load K, V and apply forward RoPE to K
     clear(tCrDK);
     clear(tCrDV);
     clear(rK);
@@ -375,7 +273,7 @@ kernel_fused_mha_varlen_bwd(
     cute::copy(rV, tVsV);
     __syncthreads();
 
-    // ==================== GIAI ĐOẠN 3: VÒNG LẶP CHÍNH THEO NHÓM GQA VÀ Q BLOCK ====================
+    // 3. Main loop over GQA heads and Q blocks
     const int num_q_blocks = (lq_i + TILE_M - 1) / TILE_M;
     const int start_q_block = IS_CAUSAL ? block_k_idx : 0;
 
@@ -580,7 +478,7 @@ kernel_fused_mha_varlen_bwd(
         }
     }
 
-    // ==================== GIAI ĐOẠN 4: EPILOGUE (XUẤT dV VÀ dK) ====================
+    // 4. Epilogue: store dV and dK
     // 4.1 Xuất dV: FP32 thanh ghi -> FP16 thanh ghi -> sStaging -> GMEM 128-bit coalesced
     CUTE_UNROLL
     for (int i = 0; i < size(tCrDV); ++i) {
@@ -634,17 +532,7 @@ kernel_fused_mha_varlen_bwd(
 // PHẦN 2: HOST FUNCTION
 // =================================================================================================
 
-/*
- * Tóm tắt hàm Host fused_mha_varlen_bwd:
- *   - Bước 1 (Kiểm tra đầu vào): Xác thực CUDA device, contiguous, dtype (FP16 cho do_grad/q/k/v/o/cos/sin,
- *     FP32 cho lse, Int32 cho cu_seqlens_q/k/offsets), số chiều và tỷ lệ GQA H_q % H_kv == 0.
- *   - Bước 2 (Cấu hình & Launch): Khởi tạo CUDAGuard, cấp phát bộ đệm dq_fp32 (FP32) và dk, dv (FP16),
- *     thiết lập Dynamic SMEM (57,600 bytes) bằng cudaFuncSetAttribute và khởi chạy kernel theo <HAS_ROPE, IS_CAUSAL>.
- *   - Bước 3 (Hoàn tất đầu ra): Ép kiểu dq = dq_fp32.to(FP16), giải phóng bộ đệm dq_fp32 và trả về tuple:
- *       + dq: (H_q, Total_Lq, 64)  [FP16]
- *       + dk: (H_kv, Total_Lk, 64) [FP16]
- *       + dv: (H_kv, Total_Lk, 64) [FP16]
- */
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_mha_varlen_bwd(
     const at::Tensor& do_grad,                        // (H_q, Total_Lq, 64) [FP16] - Gradient đầu ra dO
     const at::Tensor& q,                              // (H_q, Total_Lq, 64) [FP16] - Query gốc trước RoPE
