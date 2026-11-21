@@ -599,6 +599,7 @@ class VarlenFlashGQA(_BaseFlashGQA):
         kv_cache: Optional[VarlenKVCache] = None,
         use_cache: bool = False,
         decode: bool = False,
+        use_splitk: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, VarlenKVCache]]:
         if self.head_dim != 64:
             raise ValueError(f"CUDA kernels currently require head_dim == 64, got {self.head_dim}")
@@ -621,6 +622,7 @@ class VarlenFlashGQA(_BaseFlashGQA):
                 cos=cos,
                 sin=sin,
                 offsets=rope_offsets,
+                use_splitk=use_splitk,
             )  # (H_q, B, D)
             out_flat = attn_out.transpose(0, 1).contiguous().view(x.shape[0], -1)
             final_out = self.out_proj(out_flat)
@@ -879,6 +881,7 @@ class FlashGQA(_BaseFlashGQA):
         max_seqlen_k: Optional[int] = None,
         decode: bool = False,
         mode: Optional[str] = None,
+        use_splitk: Optional[bool] = None,
     ):
         active_mode = self.mode if mode is None else mode
         if active_mode == "kernel":
@@ -895,6 +898,7 @@ class FlashGQA(_BaseFlashGQA):
                 kv_cache=kv_cache,
                 use_cache=use_cache,
                 decode=decode,
+                use_splitk=use_splitk,
             )
         if active_mode == "varlen_ref":
             return VarlenFlashGQABaselineCorrectness.forward(
