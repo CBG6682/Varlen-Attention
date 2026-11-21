@@ -1,15 +1,24 @@
-<h1 align="center">Welcome to Varlen-Attention 👋</h1>
-
-<p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-blue.svg?style=flat">
-  <img alt="CUDA" src="https://img.shields.io/badge/cuda-%3E%3D11.8-blue.svg?style=flat">
-  <img alt="PyTorch" src="https://img.shields.io/badge/pytorch-%3E%3D2.0-blue.svg?style=flat">
-  <img alt="Python" src="https://img.shields.io/badge/python-%3E%3D3.10-blue.svg?style=flat">
-  <img alt="Maintained" src="https://img.shields.io/badge/Maintained%3F-yes-green.svg?style=flat">
-  <img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-yellow.svg?style=flat">
-</p>
+<h1 align="center">
+  <img src="docs/images/title.svg" alt="Varlen-Attention" width="720">
+</h1>
 
 <p align="center"><em>Variable-length FlashAttention, Fused RoPE, and Adaptive Split-K Flash Decoding for NVIDIA Turing (SM75).</em></p>
+
+<p align="center">
+  <img src="https://img.shields.io/github/license/CBG6682/Varlen-Attention?style=flat&logo=opensourceinitiative&logoColor=white&labelColor=454545&color=E91E63" alt="license">
+  <img src="https://img.shields.io/github/last-commit/CBG6682/Varlen-Attention?style=flat&logo=git&logoColor=white&labelColor=454545&color=E91E63" alt="last commit">
+  <img src="https://img.shields.io/github/languages/top/CBG6682/Varlen-Attention?style=flat&logo=nvidia&logoColor=white&labelColor=454545&color=E91E63" alt="top language">
+  <img src="https://img.shields.io/github/languages/count/CBG6682/Varlen-Attention?style=flat&logo=github&logoColor=white&labelColor=454545&color=E91E63" alt="languages">
+</p>
+
+<p align="center"><em>Built with the tools and technologies:</em></p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/CUDA-76B900.svg?style=flat&logo=nvidia&logoColor=white" alt="CUDA">
+  <img src="https://img.shields.io/badge/PyTorch-EE4C2C.svg?style=flat&logo=pytorch&logoColor=white" alt="PyTorch">
+  <img src="https://img.shields.io/badge/Python-3776AB.svg?style=flat&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/C%2B%2B20-00599C.svg?style=flat&logo=cplusplus&logoColor=white" alt="C++20">
+</p>
 
 | **3.00x** | **9.22x** | **4.15x** | **-68%** |
 |:---:|:---:|:---:|:---:|
@@ -181,6 +190,7 @@ Varlen-Attention/
 ├── tests/                    # Correctness tests and training/inference benchmarks
 ├── benchmark/                # End-to-end Colab/Kaggle demo notebook
 ├── assets/                   # Generated benchmark figures
+├── docs/images/              # Animated SVG title
 ├── wheels/                   # Prebuilt wheel package
 └── setup.py                  # SM75 NVCC build and CUTLASS lookup
 ```
