@@ -169,7 +169,9 @@ if should_compile:
             "binding.cpp",
             "mha_fwd.cu",
             "mha_bwd.cu",
+            "kv_cache.cu",
             "mha_decode.cu",
+            "gqa_fused.cu",
         ]
     ]
 

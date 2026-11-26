@@ -45,26 +45,31 @@ template <
     typename S2RCopyAtomB_MNMajor
 >
 __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
-    const Element* __restrict__ gQ_ptr,          // shape: (H_q, Total_Lq, 64), dtype: FP16
-    const Element* __restrict__ gK_ptr,          // shape: (H_kv, Total_Lk, 64), dtype: FP16
-    const Element* __restrict__ gV_ptr,          // shape: (H_kv, Total_Lk, 64), dtype: FP16
-    const int32_t* __restrict__ cu_seqlens_q,    // shape: (B + 1,), dtype: int32
-    const int32_t* __restrict__ cu_seqlens_k,    // shape: (B + 1,), dtype: int32
-    const Element* __restrict__ gCos_ptr,        // shape: (L_max, 64), dtype: FP16 (nullptr if !HAS_ROPE)
-    const Element* __restrict__ gSin_ptr,        // shape: (L_max, 64), dtype: FP16 (nullptr if !HAS_ROPE)
-    const int32_t* __restrict__ offsets_ptr,     // shape: (B,), dtype: int32 (nullptr if offset == 0)
-    Element*       __restrict__ gO_ptr,          // shape: (H_q, Total_Lq, 64), dtype: FP16
-    float*         __restrict__ gLSE_ptr,        // shape: (H_q, Total_Lq), dtype: FP32
+    const Element* __restrict__ gQ_ptr,          // (Total_Lq, H_q, 64) [FP16]
+    const Element* __restrict__ gK_ptr,          // (Total_Lk, H_kv, 64) [FP16]
+    const Element* __restrict__ gV_ptr,          // (Total_Lk, H_kv, 64) [FP16]
+    const int32_t* __restrict__ cu_seqlens_q,    // (B + 1,) [Int32]
+    const int32_t* __restrict__ cu_seqlens_k,    // (B + 1,) [Int32]
+    const Element* __restrict__ gCos_ptr,        // (L_max, 64) [FP16] (nullptr if !HAS_ROPE)
+    const Element* __restrict__ gSin_ptr,        // (L_max, 64) [FP16] (nullptr if !HAS_ROPE)
+    const int32_t* __restrict__ offsets_ptr,     // (B,) [Int32] (nullptr if offset == 0)
+    Element*       __restrict__ gO_ptr,          // (Total_Lq, H_q, 64) [FP16]
+    float*         __restrict__ gLSE_ptr,        // (H_q, Total_Lq) [FP32] (nullable)
+    int64_t q_stride_l,                          // scalar: int64
+    int64_t q_stride_h,                          // scalar: int64
+    int64_t k_stride_l,                          // scalar: int64
+    int64_t k_stride_h,                          // scalar: int64
+    int64_t v_stride_l,                          // scalar: int64
+    int64_t v_stride_h,                          // scalar: int64
+    int64_t o_stride_l,                          // scalar: int64
+    int64_t o_stride_h,                          // scalar: int64
     int64_t total_lq,                            // scalar: int64
-    int64_t total_lk,                            // scalar: int64
     int64_t l_max,                               // scalar: int64
     int H_q,                                     // scalar: int
     int H_kv,                                    // scalar: int
     float scale                                  // scalar: float (1 / sqrt(64) = 0.125)
 ) {
-    // -------------------------------------------------------------------------------------
     // 1. Varlen sequence bounds & coordinates
-    // -------------------------------------------------------------------------------------
     const int block_q_idx = static_cast<int>(blockIdx.x);
     const int head_q_idx  = static_cast<int>(blockIdx.y);
     const int seq_idx     = static_cast<int>(blockIdx.z);
@@ -72,7 +77,6 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     const int rep         = H_q / H_kv;
     const int head_kv_idx = head_q_idx / rep;
 
-    // Read sequence bounds and RoPE offset
     const int q_start    = cu_seqlens_q[seq_idx];
     const int q_end      = cu_seqlens_q[seq_idx + 1];
     const int lq_i       = q_end - q_start;
@@ -100,21 +104,20 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     const int  col_vec_idx    = tid % (TILE_K / 8);
     const bool is_second_half = (col_vec_idx >= 4);
 
-    // Offset base pointers to (head, seq_start)
-    const Element* q_base_ptr   = gQ_ptr   + (static_cast<int64_t>(head_q_idx) * total_lq + q_start) * TILE_K;
-    const Element* k_base_ptr   = gK_ptr   + (static_cast<int64_t>(head_kv_idx) * total_lk + k_start) * TILE_K;
-    const Element* v_base_ptr   = gV_ptr   + (static_cast<int64_t>(head_kv_idx) * total_lk + k_start) * TILE_K;
-    Element*       o_base_ptr   = gO_ptr   + (static_cast<int64_t>(head_q_idx) * total_lq + q_start) * TILE_K;
-    float*         lse_head_ptr = gLSE_ptr + (static_cast<int64_t>(head_q_idx) * total_lq + q_start);
+    // Offset base pointers to (seq_start, head) in (L, H, D) strided layout
+    const Element* q_base_ptr   = gQ_ptr + static_cast<int64_t>(q_start) * q_stride_l + static_cast<int64_t>(head_q_idx)  * q_stride_h;
+    const Element* k_base_ptr   = gK_ptr + static_cast<int64_t>(k_start) * k_stride_l + static_cast<int64_t>(head_kv_idx) * k_stride_h;
+    const Element* v_base_ptr   = gV_ptr + static_cast<int64_t>(k_start) * v_stride_l + static_cast<int64_t>(head_kv_idx) * v_stride_h;
+    Element*       o_base_ptr   = gO_ptr + static_cast<int64_t>(q_start) * o_stride_l + static_cast<int64_t>(head_q_idx)  * o_stride_h;
+    float*         lse_head_ptr = (gLSE_ptr != nullptr)
+        ? (gLSE_ptr + static_cast<int64_t>(head_q_idx) * total_lq + q_start)
+        : nullptr;
 
     const Element* cos_seq_ptr  = HAS_ROPE ? (gCos_ptr + static_cast<int64_t>(seq_offset) * TILE_K) : nullptr;
     const Element* sin_seq_ptr  = HAS_ROPE ? (gSin_ptr + static_cast<int64_t>(seq_offset) * TILE_K) : nullptr;
     const int64_t  cos_rows     = HAS_ROPE ? (l_max - static_cast<int64_t>(seq_offset)) : 0;
 
-    // -------------------------------------------------------------------------------------
-    // 2. Tensor & SMEM partitioning
-    // -------------------------------------------------------------------------------------
-    // 16 KB dynamic SMEM split into two 8 KB buffers (sBuf0: Q/K, sBuf1: V/O)
+    // 2. Tensor & SMEM partitioning (16 KB dynamic SMEM split into two 8 KB buffers)
     extern __shared__ __align__(16) uint8_t smem_raw[];
     Element* sBuf0_ptr = reinterpret_cast<Element*>(smem_raw);
     Element* sBuf1_ptr = reinterpret_cast<Element*>(smem_raw + TILE_M * TILE_K * sizeof(Element));
@@ -123,11 +126,11 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     Tensor sBuf1      = make_tensor(make_smem_ptr(sBuf1_ptr), SmemLayoutKMajor{});
     Tensor sBuf1_V_mn = make_tensor(make_smem_ptr(sBuf1_ptr), SmemLayoutMNMajor{});
 
-    // Packed GMEM tensors for current sequence
-    Tensor mQ   = make_tensor(make_gmem_ptr(q_base_ptr),  make_shape(lq_i, Int<TILE_K>{}),     make_stride(Int<TILE_K>{}, Int<1>{}));
-    Tensor mK   = make_tensor(make_gmem_ptr(k_base_ptr),  make_shape(lk_i, Int<TILE_K>{}),     make_stride(Int<TILE_K>{}, Int<1>{}));
-    Tensor mV   = make_tensor(make_gmem_ptr(v_base_ptr),  make_shape(lk_i, Int<TILE_K>{}),     make_stride(Int<TILE_K>{}, Int<1>{}));
-    Tensor mO   = make_tensor(make_gmem_ptr(o_base_ptr),  make_shape(lq_i, Int<TILE_K>{}),     make_stride(Int<TILE_K>{}, Int<1>{}));
+    // Strided THD GMEM tensors for current sequence and head
+    Tensor mQ   = make_tensor(make_gmem_ptr(q_base_ptr),  make_shape(lq_i, Int<TILE_K>{}),     make_stride(q_stride_l,   Int<1>{}));
+    Tensor mK   = make_tensor(make_gmem_ptr(k_base_ptr),  make_shape(lk_i, Int<TILE_K>{}),     make_stride(k_stride_l,   Int<1>{}));
+    Tensor mV   = make_tensor(make_gmem_ptr(v_base_ptr),  make_shape(lk_i, Int<TILE_K>{}),     make_stride(v_stride_l,   Int<1>{}));
+    Tensor mO   = make_tensor(make_gmem_ptr(o_base_ptr),  make_shape(lq_i, Int<TILE_K>{}),     make_stride(o_stride_l,   Int<1>{}));
     Tensor mCos = make_tensor(make_gmem_ptr(cos_seq_ptr), make_shape(cos_rows, Int<TILE_K>{}), make_stride(Int<TILE_K>{}, Int<1>{}));
     Tensor mSin = make_tensor(make_gmem_ptr(sin_seq_ptr), make_shape(cos_rows, Int<TILE_K>{}), make_stride(Int<TILE_K>{}, Int<1>{}));
 
@@ -189,14 +192,14 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
 
     // LSE output tensor and lane-leader predication
     Tensor tLgLSE = make_tensor(
-        make_gmem_ptr(lse_head_ptr + q_start_row + warp_id * 16 + quad_id),
+        make_gmem_ptr((lse_head_ptr != nullptr) ? (lse_head_ptr + q_start_row + warp_id * 16 + quad_id) : nullptr),
         make_shape(Int<1>{}, Int<2>{}),
         make_stride(Int<1>{}, Int<8>{})
     );
     Tensor tLrLSE = make_tensor<float>(make_shape(Int<1>{}, Int<2>{}), make_stride(Int<1>{}, Int<1>{}));
     Tensor tLpLSE = make_tensor<bool>(make_shape(Int<1>{}, Int<2>{}), make_stride(Int<1>{}, Int<1>{}));
-    tLpLSE(0, 0) = (lane_in_quad == 0) && (global_row_a < lq_i);
-    tLpLSE(0, 1) = (lane_in_quad == 0) && (global_row_b < lq_i);
+    tLpLSE(0, 0) = (gLSE_ptr != nullptr) && (lane_in_quad == 0) && (global_row_a < lq_i);
+    tLpLSE(0, 1) = (gLSE_ptr != nullptr) && (lane_in_quad == 0) && (global_row_b < lq_i);
 
     // TiledMMA, S2R copy atoms, and shared operand fragments
     TiledMMAType tiled_mma;
@@ -436,10 +439,12 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
         tCrO(3, 0, n) *= inv_l_b;
     }
 
-    // Store FP32 LSE with lane-leader predication
-    tLrLSE(0, 0) = (l_old_a > 0.0f && m_old_a != NEG_INF) ? (m_old_a + __logf(l_old_a)) : NEG_INF;
-    tLrLSE(0, 1) = (l_old_b > 0.0f && m_old_b != NEG_INF) ? (m_old_b + __logf(l_old_b)) : NEG_INF;
-    cute::copy_if(CopyAtomLSE{}, tLpLSE, tLrLSE, tLgLSE);
+    // Store FP32 LSE with lane-leader predication when backward buffer is requested
+    if (gLSE_ptr != nullptr) {
+        tLrLSE(0, 0) = (l_old_a > 0.0f && m_old_a != NEG_INF) ? (m_old_a + __logf(l_old_a)) : NEG_INF;
+        tLrLSE(0, 1) = (l_old_b > 0.0f && m_old_b != NEG_INF) ? (m_old_b + __logf(l_old_b)) : NEG_INF;
+        cute::copy_if(CopyAtomLSE{}, tLpLSE, tLrLSE, tLgLSE);
+    }
 
     // Convert FP32 accumulator to FP16 -> R2S into swizzled sBuf1 -> 128-bit S2G
     Tensor rO_fp16 = make_tensor<Element>(shape(tCrO));
@@ -458,53 +463,77 @@ __global__ void __launch_bounds__(NUM_THREADS) kernel_fused_mha_varlen_fwd(
     }
 }
 
-// Host wrapper for fused_mha_varlen_fwd.
+// Host launcher writing directly into preallocated o (and optional lse)
 
-std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
-    const at::Tensor& q,                                     // (H_q, Total_Lq, 64) [FP16]
-    const at::Tensor& k,                                     // (H_kv, Total_Lk, 64) [FP16]
-    const at::Tensor& v,                                     // (H_kv, Total_Lk, 64) [FP16]
+void launch_fused_mha_varlen_fwd_into(
+    const at::Tensor& q,                                     // (Total_Lq, H_q, 64) [FP16]
+    const at::Tensor& k,                                     // (Total_Lk, H_kv, 64) [FP16]
+    const at::Tensor& v,                                     // (Total_Lk, H_kv, 64) [FP16]
     const at::Tensor& cu_seqlens_q,                          // (B + 1,) [Int32]
     const at::Tensor& cu_seqlens_k,                          // (B + 1,) [Int32]
     int64_t max_seqlen_q,                                    // scalar [int64]
+    at::Tensor& o,                                           // (Total_Lq, H_q, 64) [FP16]
+    const std::optional<at::Tensor>& lse_opt,                // (H_q, Total_Lq) [FP32] (optional)
     const std::optional<at::Tensor>& cos,                    // (L_max, 64) [FP16] (optional)
     const std::optional<at::Tensor>& sin,                    // (L_max, 64) [FP16] (optional)
     bool is_causal,                                          // scalar [bool]
     const std::optional<at::Tensor>& offsets                 // (B,) [Int32] (optional)
 ) {
-    // -------------------------------------------------------------------------------------
     // 1. Input validation
-    // -------------------------------------------------------------------------------------
     at::cuda::CUDAGuard device_guard(q.device());
 
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q, k, v must be CUDA tensors");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && o.is_cuda(), "q, k, v, o must be CUDA tensors");
     TORCH_CHECK(cu_seqlens_q.is_cuda() && cu_seqlens_k.is_cuda(), "cu_seqlens_q and cu_seqlens_k must be CUDA tensors");
     TORCH_CHECK(
-        k.device() == q.device() && v.device() == q.device() &&
+        k.device() == q.device() && v.device() == q.device() && o.device() == q.device() &&
         cu_seqlens_q.device() == q.device() && cu_seqlens_k.device() == q.device(),
         "All input tensors must reside on the same CUDA device"
     );
 
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "q, k, v must be contiguous");
     TORCH_CHECK(cu_seqlens_q.is_contiguous() && cu_seqlens_k.is_contiguous(), "cu_seqlens_q and cu_seqlens_k must be contiguous");
-
-    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf, "q, k, v must be float16");
+    TORCH_CHECK(
+        q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf &&
+        v.scalar_type() == at::kHalf && o.scalar_type() == at::kHalf,
+        "q, k, v, o must be float16"
+    );
     TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt && cu_seqlens_k.scalar_type() == at::kInt, "cu_seqlens_q and cu_seqlens_k must be int32");
 
-    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "q, k, v must be 3D tensors (H, Total_L, D)");
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && o.dim() == 3, "q, k, v, o must be 3D tensors (Total_L, H, 64)");
     TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1, "cu_seqlens_q and cu_seqlens_k must be 1D tensors");
     TORCH_CHECK(cu_seqlens_q.size(0) == cu_seqlens_k.size(0) && cu_seqlens_q.size(0) >= 1, "cu_seqlens_q and cu_seqlens_k must have identical length >= 1");
 
-    const int64_t H_q      = q.size(0);
-    const int64_t Total_Lq = q.size(1);
+    const int64_t Total_Lq = q.size(0);
+    const int64_t H_q      = q.size(1);
     const int64_t head_dim = q.size(2);
-    const int64_t H_kv     = k.size(0);
-    const int64_t Total_Lk = k.size(1);
+    const int64_t Total_Lk = k.size(0);
+    const int64_t H_kv     = k.size(1);
     const int64_t B        = cu_seqlens_q.size(0) - 1;
 
-    TORCH_CHECK(head_dim == 64 && k.size(2) == 64 && v.size(2) == 64, "head_dim must be fixed to 64");
-    TORCH_CHECK(v.size(0) == H_kv && v.size(1) == Total_Lk, "v shape must match k shape (H_kv, Total_Lk, 64)");
+    TORCH_CHECK(head_dim == 64 && k.size(2) == 64 && v.size(2) == 64 && o.size(2) == 64, "head_dim must be fixed to 64");
+    TORCH_CHECK(o.size(0) == Total_Lq && o.size(1) == H_q, "o shape must match (Total_Lq, H_q, 64)");
+    TORCH_CHECK(v.size(0) == Total_Lk && v.size(1) == H_kv, "v shape must match k shape (Total_Lk, H_kv, 64)");
     TORCH_CHECK(H_q > 0 && H_kv > 0 && (H_q % H_kv == 0), "H_q must be positive and divisible by H_kv for GQA");
+
+    // Verify 128-bit vector alignment on strided THD tensors
+    TORCH_CHECK(
+        q.stride(2) == 1 && k.stride(2) == 1 && v.stride(2) == 1 && o.stride(2) == 1,
+        "q, k, v, o last dimension must have stride 1"
+    );
+    TORCH_CHECK(
+        (q.stride(0) % 8 == 0) && (q.stride(1) % 8 == 0) &&
+        (k.stride(0) % 8 == 0) && (k.stride(1) % 8 == 0) &&
+        (v.stride(0) % 8 == 0) && (v.stride(1) % 8 == 0) &&
+        (o.stride(0) % 8 == 0) && (o.stride(1) % 8 == 0),
+        "q, k, v, o token and head strides must be multiples of 8 for 128-bit vector access"
+    );
+
+    const bool has_lse = lse_opt.has_value();
+    if (has_lse) {
+        TORCH_CHECK(lse_opt->is_cuda() && lse_opt->device() == q.device(), "lse must reside on the same CUDA device as q");
+        TORCH_CHECK(lse_opt->is_contiguous(), "lse must be contiguous");
+        TORCH_CHECK(lse_opt->scalar_type() == at::kFloat, "lse must be float32");
+        TORCH_CHECK(lse_opt->dim() == 2 && lse_opt->size(0) == H_q && lse_opt->size(1) == Total_Lq, "lse must have shape (H_q, Total_Lq)");
+    }
 
     const bool has_cos = cos.has_value();
     const bool has_sin = sin.has_value();
@@ -534,21 +563,17 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
         TORCH_CHECK(offsets->dim() == 1 && offsets->size(0) == B, "offsets must be a 1D tensor of shape (B,)");
     }
 
-    // -------------------------------------------------------------------------------------
     // 2. Kernel launch setup
-    // -------------------------------------------------------------------------------------
-    // Handle empty inputs and allocate o (FP16), lse (FP32)
     if (Total_Lq == 0 || max_seqlen_q <= 0 || B <= 0) {
-        return std::make_tuple(
-            torch::zeros_like(q),
-            torch::full({H_q, Total_Lq}, -std::numeric_limits<float>::infinity(), q.options().dtype(at::kFloat))
-        );
+        if (Total_Lq > 0) {
+            o.zero_();
+        }
+        if (has_lse && lse_opt->numel() > 0) {
+            lse_opt->fill_(-std::numeric_limits<float>::infinity());
+        }
+        return;
     }
 
-    at::Tensor o   = torch::empty_like(q);
-    at::Tensor lse = torch::empty({H_q, Total_Lq}, q.options().dtype(at::kFloat));
-
-    // Kernel launch constants
     using Element = cutlass::half_t;
     constexpr int TILE_M      = 64;
     constexpr int TILE_N      = 64;
@@ -565,7 +590,6 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     );
     dim3 block(NUM_THREADS, 1, 1);
 
-    // Swizzled SMEM layouts
     using SmemLayoutKMajor = decltype(composition(
         Swizzle<3, 3, 3>{},
         make_layout(make_shape(Int<TILE_M>{}, Int<TILE_K>{}), make_stride(Int<TILE_K>{}, Int<1>{}))
@@ -575,7 +599,6 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
         make_layout(make_shape(Int<TILE_K>{}, Int<TILE_N>{}), make_stride(Int<1>{}, Int<TILE_K>{}))
     ));
 
-    // 128-bit G2R/S2G, LSE, and LDSM S2R copy atoms
     using CopyAtomG2R = Copy_Atom<UniversalCopy<uint4>, Element>;
     using TiledCopyG2R = decltype(make_tiled_copy(
         CopyAtomG2R{},
@@ -588,11 +611,9 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     using S2RCopyAtomB_KMajor  = Copy_Atom<SM75_U32x1_LDSM_N, Element>;
     using S2RCopyAtomB_MNMajor = Copy_Atom<SM75_U16x2_LDSM_T, Element>;
 
-    // SM75 16x8x8 TiledMMA (4x1x1)
     using MMAAtom      = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
     using TiledMMAType = TiledMMA<MMAAtom, Layout<Shape<_4, _1, _1>, Stride<_1, _4, _4>>>;
 
-    // Current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     const Element* q_ptr       = reinterpret_cast<const Element*>(q.data_ptr<at::Half>());
@@ -604,9 +625,17 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
     const Element* sin_ptr     = has_rope ? reinterpret_cast<const Element*>(sin->data_ptr<at::Half>()) : nullptr;
     const int32_t* offsets_ptr = has_offsets ? offsets->data_ptr<int32_t>() : nullptr;
     Element*       o_ptr       = reinterpret_cast<Element*>(o.data_ptr<at::Half>());
-    float*         lse_ptr     = lse.data_ptr<float>();
+    float*         lse_ptr     = has_lse ? lse_opt->data_ptr<float>() : nullptr;
 
-    // Launch kernel
+    const int64_t q_stride_l = q.stride(0);
+    const int64_t q_stride_h = q.stride(1);
+    const int64_t k_stride_l = k.stride(0);
+    const int64_t k_stride_h = k.stride(1);
+    const int64_t v_stride_l = v.stride(0);
+    const int64_t v_stride_h = v.stride(1);
+    const int64_t o_stride_l = o.stride(0);
+    const int64_t o_stride_h = o.stride(1);
+
     {
         auto launch_fwd = [&](auto has_rope_tag, auto is_causal_tag) {
             constexpr bool kHasRope  = decltype(has_rope_tag)::value;
@@ -639,8 +668,15 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
                 offsets_ptr,
                 o_ptr,
                 lse_ptr,
+                q_stride_l,
+                q_stride_h,
+                k_stride_l,
+                k_stride_h,
+                v_stride_l,
+                v_stride_h,
+                o_stride_l,
+                o_stride_h,
                 Total_Lq,
-                Total_Lk,
                 l_max,
                 static_cast<int>(H_q),
                 static_cast<int>(H_kv),
@@ -663,11 +699,34 @@ std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
             }
         }
     }
+}
 
-    // No intermediate buffers to release
+// Public host wrapper for fused_mha_varlen_fwd.
+// Returns (o: (Total_Lq, H_q, 64) [FP16], lse: (H_q, Total_Lq) [FP32]).
 
-    // -------------------------------------------------------------------------------------
-    // 3. Return outputs
-    // -------------------------------------------------------------------------------------
+std::tuple<at::Tensor, at::Tensor> fused_mha_varlen_fwd(
+    const at::Tensor& q,                                     // (Total_Lq, H_q, 64) [FP16]
+    const at::Tensor& k,                                     // (Total_Lk, H_kv, 64) [FP16]
+    const at::Tensor& v,                                     // (Total_Lk, H_kv, 64) [FP16]
+    const at::Tensor& cu_seqlens_q,                          // (B + 1,) [Int32]
+    const at::Tensor& cu_seqlens_k,                          // (B + 1,) [Int32]
+    int64_t max_seqlen_q,                                    // scalar [int64]
+    const std::optional<at::Tensor>& cos,                    // (L_max, 64) [FP16] (optional)
+    const std::optional<at::Tensor>& sin,                    // (L_max, 64) [FP16] (optional)
+    bool is_causal,                                          // scalar [bool]
+    const std::optional<at::Tensor>& offsets                 // (B,) [Int32] (optional)
+) {
+    TORCH_CHECK(q.dim() == 3, "q must be a 3D tensor (Total_Lq, H_q, 64)");
+    const int64_t Total_Lq = q.size(0);
+    const int64_t H_q      = q.size(1);
+
+    at::Tensor o   = torch::empty({Total_Lq, H_q, 64}, q.options());
+    at::Tensor lse = torch::empty({H_q, Total_Lq}, q.options().dtype(at::kFloat));
+
+    launch_fused_mha_varlen_fwd_into(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
+        o, lse, cos, sin, is_causal, offsets
+    );
+
     return std::make_tuple(o, lse);
 }

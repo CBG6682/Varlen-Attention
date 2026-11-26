@@ -40,20 +40,25 @@ template <
 >
 __global__ void __launch_bounds__(NUM_THREADS)
 kernel_fused_mha_varlen_decode_splitk(
-    const cutlass::half_t* __restrict__ Q_ptr,        // (H_q, B, 64) [FP16] - decode query
-    const cutlass::half_t* __restrict__ K_ptr,        // (H_kv, Total_Lk, 64) [FP16] - Raw Key cache packed
-    const cutlass::half_t* __restrict__ V_ptr,        // (H_kv, Total_Lk, 64) [FP16] - Value cache packed
-    const int32_t* __restrict__ cu_seqlens_k_ptr,     // (B + 1,) [Int32] - cumulative K/V lengths
+    const cutlass::half_t* __restrict__ Q_ptr,        // (B, H_q, 64) [FP16] - decode query
+    const cutlass::half_t* __restrict__ K_ptr,        // (num_pages, 16, H_kv, 64) [FP16] - Paged Key cache
+    const cutlass::half_t* __restrict__ V_ptr,        // (num_pages, 16, H_kv, 64) [FP16] - Paged Value cache
+    const int32_t* __restrict__ block_table_ptr,      // (B, max_pages_per_seq) [Int32] - page table
+    const int32_t* __restrict__ cache_seqlens_ptr,    // (B,) [Int32] - sequence lengths in cache
     const cutlass::half_t* __restrict__ cos_ptr,      // (L_max, 64) [FP16] - RoPE cos table (or nullptr)
     const cutlass::half_t* __restrict__ sin_ptr,      // (L_max, 64) [FP16] - RoPE sin table (or nullptr)
     const int32_t* __restrict__ offsets_ptr,          // (B,) [Int32] - per-sequence RoPE offset (or nullptr)
     float* __restrict__ O_part_ptr,                   // (H_q, B, num_splits, 64) [FP32] - partial split outputs (nullptr if !USE_SPLITK)
     float* __restrict__ LSE_part_ptr,                 // (H_q, B, num_splits) [FP32] - partial split LSE (nullptr if !USE_SPLITK)
-    cutlass::half_t* __restrict__ O_direct_ptr,       // (H_q, B, 64) [FP16] - direct output (when !USE_SPLITK)
+    cutlass::half_t* __restrict__ O_direct_ptr,       // (B, H_q, 64) [FP16] - direct output (when !USE_SPLITK)
+    int64_t q_stride_b,                               // scalar [int64] - query batch stride
+    int64_t q_stride_h,                               // scalar [int64] - query head stride
+    int64_t o_stride_b,                               // scalar [int64] - direct output batch stride
+    int64_t o_stride_h,                               // scalar [int64] - direct output head stride
     int H_q,                                          // scalar [int] - number of Q heads
     int H_kv,                                         // scalar [int] - number of K/V heads
     int B,                                            // scalar [int] - Batch size
-    int Total_Lk,                                     // scalar [int] - total KV cache tokens
+    int max_pages_per_seq,                            // scalar [int] - block_table column stride
     int num_splits,                                   // scalar [int] - number of Split-K chunks
     float sm_scale                                    // scalar [float] - 1 / sqrt(64) softmax scale
 ) {
@@ -64,13 +69,12 @@ kernel_fused_mha_varlen_decode_splitk(
     const int seq_idx = static_cast<int>(blockIdx.z);
     const int head_kv_idx = head_q_idx / (H_q / H_kv);
 
-    const int k_start = cu_seqlens_k_ptr[seq_idx];
-    const int k_end = cu_seqlens_k_ptr[seq_idx + 1];
-    const int lk_i = k_end - k_start;
-
-    const int tokens_per_split = USE_SPLITK ? ((lk_i + num_splits - 1) / num_splits) : lk_i;
-    const int split_start = USE_SPLITK ? (split_idx * tokens_per_split) : 0;
-    const int split_end = USE_SPLITK ? min(split_start + tokens_per_split, lk_i) : lk_i;
+    const int lk_i = cache_seqlens_ptr[seq_idx];
+    const int num_pages_i = (lk_i + TILE_K_TOKENS - 1) / TILE_K_TOKENS;
+    const int pages_per_split = USE_SPLITK ? ((num_pages_i + num_splits - 1) / num_splits) : num_pages_i;
+    const int split_start_page = USE_SPLITK ? (split_idx * pages_per_split) : 0;
+    const int split_start = split_start_page * TILE_K_TOKENS;
+    const int split_end = USE_SPLITK ? min(split_start + pages_per_split * TILE_K_TOKENS, lk_i) : lk_i;
     const int split_len = split_end - split_start;
 
     // Dynamic shared memory (4,224 B) for Epilogue 16->1 reduction
@@ -163,8 +167,10 @@ kernel_fused_mha_varlen_decode_splitk(
     Tensor tPredLeader = make_tensor<bool>(make_shape(size<1>(tLgLSE), size<2>(tLgLSE)));
     tPredLeader(0, 0) = (tid == 0);
 
+    const int64_t o_direct_off =
+        static_cast<int64_t>(seq_idx) * o_stride_b + static_cast<int64_t>(head_q_idx) * o_stride_h;
     Tensor gO_direct_bcast = make_tensor(
-        make_gmem_ptr(USE_SPLITK ? nullptr : (O_direct_ptr + head_seq_idx * HEAD_DIM)),
+        make_gmem_ptr(USE_SPLITK ? nullptr : (O_direct_ptr + o_direct_off)),
         make_shape(_16{}, Int<HEAD_DIM>{}),
         make_stride(_0{}, _1{}));
     Tensor tOgO_direct = thr_copy_store_fp16.partition_D(gO_direct_bcast);
@@ -190,8 +196,10 @@ kernel_fused_mha_varlen_decode_splitk(
     const int offset = (HAS_ROPE && offsets_ptr != nullptr) ? offsets_ptr[seq_idx] : 0;
 
     // Predeclare fragments for 2-stage register prefetch
+    const int64_t q_off =
+        static_cast<int64_t>(seq_idx) * q_stride_b + static_cast<int64_t>(head_q_idx) * q_stride_h;
     Tensor gQ_bcast = make_tensor(
-        make_gmem_ptr(Q_ptr + (static_cast<int64_t>(head_q_idx) * B + seq_idx) * HEAD_DIM),
+        make_gmem_ptr(Q_ptr + q_off),
         make_shape(Int<TILE_K_TOKENS>{}, Int<HEAD_DIM>{}),
         make_stride(_0{}, _1{}));
     Tensor tQgQ = thr_copy_kv.partition_S(gQ_bcast);
@@ -246,7 +254,9 @@ kernel_fused_mha_varlen_decode_splitk(
     Tensor tPredLast = make_tensor<bool>(make_shape(size<1>(tQgQ), size<2>(tQgQ)));
     tPredLast(0, 0) = (row_in_tile < last_valid_rows);
 
-    const int64_t kv_head_base = static_cast<int64_t>(head_kv_idx) * Total_Lk * HEAD_DIM;
+    const int32_t* block_table_seq =
+        block_table_ptr + static_cast<int64_t>(seq_idx) * max_pages_per_seq;
+    const int64_t kv_row_stride = static_cast<int64_t>(H_kv) * HEAD_DIM;
 
     // 2. Main loop (2-stage register prefetch)
     clear(rO_acc);
@@ -255,16 +265,18 @@ kernel_fused_mha_varlen_decode_splitk(
 
     auto load_tile = [&](int tile_idx, auto& rK_buf, auto& rV_buf, auto& rCos_buf, auto& rSin_buf) {
         const int token_base = split_start + tile_idx * TILE_K_TOKENS;
-        const int64_t kv_tile_off = kv_head_base + static_cast<int64_t>(k_start + token_base) * HEAD_DIM;
+        const int physical_page = block_table_seq[split_start_page + tile_idx];
+        const int64_t kv_page_off =
+            (static_cast<int64_t>(physical_page) * TILE_K_TOKENS * H_kv + head_kv_idx) * HEAD_DIM;
 
         Tensor gK_tile = make_tensor(
-            make_gmem_ptr(K_ptr + kv_tile_off),
+            make_gmem_ptr(K_ptr + kv_page_off),
             make_shape(Int<TILE_K_TOKENS>{}, Int<HEAD_DIM>{}),
-            make_stride(Int<HEAD_DIM>{}, _1{}));
+            make_stride(kv_row_stride, _1{}));
         Tensor gV_tile = make_tensor(
-            make_gmem_ptr(V_ptr + kv_tile_off),
+            make_gmem_ptr(V_ptr + kv_page_off),
             make_shape(Int<TILE_K_TOKENS>{}, Int<HEAD_DIM>{}),
-            make_stride(Int<HEAD_DIM>{}, _1{}));
+            make_stride(kv_row_stride, _1{}));
 
         Tensor tKgK = thr_copy_kv.partition_S(gK_tile);
         Tensor tVgV = thr_copy_kv.partition_S(gV_tile);
@@ -420,7 +432,9 @@ __global__ void __launch_bounds__(NUM_THREADS)
 kernel_fused_mha_varlen_decode_reduce(
     const float* __restrict__ O_part_ptr,   // (H_q, B, num_splits, 64) [FP32]
     const float* __restrict__ LSE_part_ptr, // (H_q, B, num_splits) [FP32]
-    cutlass::half_t* __restrict__ O_ptr,    // (H_q, B, 64) [FP16]
+    cutlass::half_t* __restrict__ O_ptr,    // (B, H_q, 64) [FP16]
+    int64_t o_stride_b,                     // scalar [int64] - output batch stride
+    int64_t o_stride_h,                     // scalar [int64] - output head stride
     int B,                                  // scalar [int] - Batch size
     int num_splits                          // scalar [int] - number of Split-K chunks
 ) {
@@ -448,11 +462,13 @@ kernel_fused_mha_varlen_decode_reduce(
 
     // Output tensor & prefetch fragments
     const int64_t head_seq_idx = static_cast<int64_t>(head_q_idx) * B + seq_idx;
+    const int64_t o_out_off =
+        static_cast<int64_t>(seq_idx) * o_stride_b + static_cast<int64_t>(head_q_idx) * o_stride_h;
     const float* lse_part_base = LSE_part_ptr + head_seq_idx * num_splits;
     const float* o_part_base = O_part_ptr + head_seq_idx * num_splits * HEAD_DIM;
 
     Tensor gO_bcast = make_tensor(
-        make_gmem_ptr(O_ptr + head_seq_idx * HEAD_DIM),
+        make_gmem_ptr(O_ptr + o_out_off),
         make_shape(_16{}, Int<HEAD_DIM>{}),
         make_stride(_0{}, _1{}));
     Tensor tOgO = thr_copy_store_fp16.partition_D(gO_bcast);
@@ -565,56 +581,72 @@ kernel_fused_mha_varlen_decode_reduce(
 // =================================================================================================
 
 
-at::Tensor fused_mha_varlen_decode(
-    const at::Tensor& q,                              // (H_q, B, 64) [FP16] - decode query
-    const at::Tensor& k_cache,                        // (H_kv, Total_Lk, 64) [FP16] - Raw Key cache packed
-    const at::Tensor& v_cache,                        // (H_kv, Total_Lk, 64) [FP16] - Value cache packed
-    const at::Tensor& cu_seqlens_k,                   // (B + 1,) [Int32] - cumulative K/V lengths
+void launch_fused_mha_varlen_decode_into(
+    const at::Tensor& q,                              // (B, H_q, 64) [FP16]
+    const at::Tensor& k_cache,                        // (num_pages, 16, H_kv, 64) [FP16]
+    const at::Tensor& v_cache,                        // (num_pages, 16, H_kv, 64) [FP16]
+    const at::Tensor& block_table,                    // (B, max_pages_per_seq) [Int32]
+    const at::Tensor& cache_seqlens,                  // (B,) [Int32]
     int64_t max_seqlen_k,                             // scalar [int64] - max K sequence length
+    at::Tensor& o,                                    // (B, H_q, 64) [FP16]
     const std::optional<at::Tensor>& cos,             // (L_max, 64) [FP16] (optional)
     const std::optional<at::Tensor>& sin,             // (L_max, 64) [FP16] (optional)
     const std::optional<at::Tensor>& offsets,         // (B,) [Int32] (optional)
     std::optional<bool> use_splitk                    // scalar [optional<bool>] - force Split-K or Auto
 ) {
     // 1. Torch Checks
-    TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
-    TORCH_CHECK(k_cache.is_cuda(), "k_cache must be a CUDA tensor");
-    TORCH_CHECK(v_cache.is_cuda(), "v_cache must be a CUDA tensor");
-    TORCH_CHECK(cu_seqlens_k.is_cuda(), "cu_seqlens_k must be a CUDA tensor");
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda() && o.is_cuda(),
+                "q, k_cache, v_cache, o must be CUDA tensors");
+    TORCH_CHECK(block_table.is_cuda() && cache_seqlens.is_cuda(),
+                "block_table and cache_seqlens must be CUDA tensors");
 
     TORCH_CHECK(k_cache.device() == q.device() && v_cache.device() == q.device() &&
-                cu_seqlens_k.device() == q.device(),
-                "All input tensors must reside on the same CUDA device");
+                block_table.device() == q.device() && cache_seqlens.device() == q.device() &&
+                o.device() == q.device(),
+                "All input and output tensors must reside on the same CUDA device");
 
-    TORCH_CHECK(q.is_contiguous() && k_cache.is_contiguous() &&
-                v_cache.is_contiguous() && cu_seqlens_k.is_contiguous(),
-                "All input tensors must be contiguous");
+    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() &&
+                block_table.is_contiguous() && cache_seqlens.is_contiguous(),
+                "k_cache, v_cache, block_table, and cache_seqlens must be contiguous");
 
-    TORCH_CHECK(q.scalar_type() == at::kHalf, "q must be float16");
-    TORCH_CHECK(k_cache.scalar_type() == at::kHalf, "k_cache must be float16");
-    TORCH_CHECK(v_cache.scalar_type() == at::kHalf, "v_cache must be float16");
-    TORCH_CHECK(cu_seqlens_k.scalar_type() == at::kInt, "cu_seqlens_k must be int32");
+    TORCH_CHECK(q.scalar_type() == at::kHalf && k_cache.scalar_type() == at::kHalf &&
+                v_cache.scalar_type() == at::kHalf && o.scalar_type() == at::kHalf,
+                "q, k_cache, v_cache, o must be float16");
+    TORCH_CHECK(block_table.scalar_type() == at::kInt && cache_seqlens.scalar_type() == at::kInt,
+                "block_table and cache_seqlens must be int32");
 
-    TORCH_CHECK(q.dim() == 3 && k_cache.dim() == 3 && v_cache.dim() == 3,
-                "q, k_cache, v_cache must be 3D tensors");
-    TORCH_CHECK(q.size(2) == 64 && k_cache.size(2) == 64 && v_cache.size(2) == 64,
+    TORCH_CHECK(q.dim() == 3 && o.dim() == 3, "q and o must be 3D tensors (B, H_q, 64)");
+    TORCH_CHECK(k_cache.dim() == 4 && v_cache.sizes() == k_cache.sizes(),
+                "k_cache and v_cache must have identical 4D shape (num_pages, 16, H_kv, 64)");
+    TORCH_CHECK(q.size(2) == 64 && o.size(2) == 64 && k_cache.size(3) == 64,
                 "Head dimension must be 64");
-    TORCH_CHECK(v_cache.sizes() == k_cache.sizes(),
-                "v_cache shape must match k_cache shape");
+    TORCH_CHECK(k_cache.size(1) == 16, "Paged KV cache page size must be 16");
+    TORCH_CHECK(o.sizes() == q.sizes(), "o shape must match q shape (B, H_q, 64)");
+    TORCH_CHECK(
+        q.stride(2) == 1 && o.stride(2) == 1 &&
+        (q.stride(0) % 8 == 0) && (q.stride(1) % 8 == 0) &&
+        (o.stride(0) % 8 == 0) && (o.stride(1) % 8 == 0),
+        "q and o must have stride(-1) == 1 and batch/head strides divisible by 8"
+    );
 
-    TORCH_CHECK(cu_seqlens_k.dim() == 1 && cu_seqlens_k.size(0) >= 1,
-                "cu_seqlens_k must be a 1D tensor of length >= 1");
+    const int64_t B = q.size(0);
+    const int64_t H_q = q.size(1);
+    const int64_t H_kv = k_cache.size(2);
+    const int64_t num_pages = k_cache.size(0);
+
+    TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) == B,
+                "block_table must have shape (B, max_pages_per_seq)");
+    TORCH_CHECK(cache_seqlens.dim() == 1 && cache_seqlens.size(0) == B,
+                "cache_seqlens must have shape (B,)");
     TORCH_CHECK(max_seqlen_k >= 0, "max_seqlen_k must be non-negative");
-
-    const int64_t H_q = q.size(0);
-    const int64_t B = q.size(1);
-    const int64_t H_kv = k_cache.size(0);
-    const int64_t Total_Lk = k_cache.size(1);
-
-    TORCH_CHECK(cu_seqlens_k.size(0) == B + 1,
-                "cu_seqlens_k length must equal B + 1");
     TORCH_CHECK(H_q > 0 && H_kv > 0 && (H_q % H_kv == 0),
                 "H_q must be a positive multiple of H_kv");
+
+    if (B > 0 && max_seqlen_k > 0) {
+        const int64_t required_pages = (max_seqlen_k + 15) / 16;
+        TORCH_CHECK(block_table.size(1) >= required_pages,
+                    "block_table has fewer columns than required by max_seqlen_k");
+    }
 
     if (offsets.has_value()) {
         TORCH_CHECK(offsets->is_cuda() && offsets->device() == q.device() &&
@@ -634,7 +666,7 @@ at::Tensor fused_mha_varlen_decode(
                     cos->dim() == 2 && sin->dim() == 2 &&
                     cos->size(1) == 64 && cos->sizes() == sin->sizes(),
                     "cos and sin must be contiguous CUDA float16 tensors of identical shape (L_max, 64)");
-        if (B > 0 && Total_Lk > 0) {
+        if (B > 0 && max_seqlen_k > 0) {
             TORCH_CHECK(cos->size(0) > 0,
                         "cos/sin table must have L_max > 0 for non-empty KV cache");
         }
@@ -643,8 +675,11 @@ at::Tensor fused_mha_varlen_decode(
     // 2. GPU resource query & adaptive dispatch (Direct 1-Block vs Split-K)
     const c10::cuda::CUDAGuard device_guard(q.device());
 
-    if (B == 0 || max_seqlen_k == 0 || Total_Lk == 0) {
-        return at::zeros_like(q);
+    if (B == 0 || max_seqlen_k == 0 || num_pages == 0) {
+        if (B > 0) {
+            o.zero_();
+        }
+        return;
     }
 
     constexpr int HEAD_DIM = 64;
@@ -655,36 +690,49 @@ at::Tensor fused_mha_varlen_decode(
     constexpr int smem_size_splitk =
         (TILE_K_TOKENS * HEAD_DIM + 2 * TILE_K_TOKENS) * static_cast<int>(sizeof(float));
 
-    const int dev_id = q.get_device();
-    int sm_count = 0;
-    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev_id));
-
-    int max_blocks_per_sm = 0;
-    if (has_rope) {
-        auto kernel_occ = kernel_fused_mha_varlen_decode_splitk<
-            HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, true, true>;
-        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_sm, kernel_occ, NUM_THREADS, smem_size_splitk));
-    } else {
-        auto kernel_occ = kernel_fused_mha_varlen_decode_splitk<
-            HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, false, true>;
-        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_sm, kernel_occ, NUM_THREADS, smem_size_splitk));
-    }
-
-    const int64_t max_concurrent_blocks =
-        std::max<int64_t>(1, static_cast<int64_t>(sm_count) * std::max(1, max_blocks_per_sm));
-    const int64_t base_blocks = B * H_q;
-    const int64_t target_splits =
-        std::max<int64_t>(1, max_concurrent_blocks / std::max<int64_t>(1, base_blocks));
     const int64_t max_possible_splits =
         std::max<int64_t>(1, (max_seqlen_k + SPLIT_MIN_LEN - 1) / SPLIT_MIN_LEN);
 
-    // Pure B * H_q occupancy-based dispatch (no sequence-length threshold):
-    // - When B * H_q is large enough to saturate GPU occupancy (target_splits < 2),
-    //   use Direct 1-Block FP16 (no intermediate workspace, no reduction kernel).
-    // - When B * H_q is small (target_splits >= 2) and KV has >= 2 split chunks,
-    //   use Split-K Flash Decoding to fill idle SMs.
+    int64_t target_splits = 1;
+    if (!use_splitk.has_value() || use_splitk.value()) {
+        const int dev_id = q.get_device();
+        static int cached_sm_count[64] = {};
+        static int cached_max_blocks[64][2] = {};
+
+        int sm_count = (dev_id >= 0 && dev_id < 64) ? cached_sm_count[dev_id] : 0;
+        if (sm_count <= 0) {
+            C10_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev_id));
+            if (dev_id >= 0 && dev_id < 64) {
+                cached_sm_count[dev_id] = sm_count;
+            }
+        }
+
+        const int rope_idx = has_rope ? 1 : 0;
+        int max_blocks_per_sm = (dev_id >= 0 && dev_id < 64) ? cached_max_blocks[dev_id][rope_idx] : 0;
+        if (max_blocks_per_sm <= 0) {
+            if (has_rope) {
+                auto kernel_occ = kernel_fused_mha_varlen_decode_splitk<
+                    HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, true, true>;
+                C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &max_blocks_per_sm, kernel_occ, NUM_THREADS, smem_size_splitk));
+            } else {
+                auto kernel_occ = kernel_fused_mha_varlen_decode_splitk<
+                    HEAD_DIM, NUM_THREADS, TILE_K_TOKENS, false, true>;
+                C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &max_blocks_per_sm, kernel_occ, NUM_THREADS, smem_size_splitk));
+            }
+            if (dev_id >= 0 && dev_id < 64) {
+                cached_max_blocks[dev_id][rope_idx] = max_blocks_per_sm;
+            }
+        }
+
+        const int64_t max_concurrent_blocks =
+            std::max<int64_t>(1, static_cast<int64_t>(sm_count) * std::max(1, max_blocks_per_sm));
+        const int64_t base_blocks = B * H_q;
+        target_splits =
+            std::max<int64_t>(1, max_concurrent_blocks / std::max<int64_t>(1, base_blocks));
+    }
+
     const bool run_splitk = use_splitk.has_value()
         ? use_splitk.value()
         : ((target_splits >= 2) && (max_possible_splits >= 2));
@@ -693,7 +741,6 @@ at::Tensor fused_mha_varlen_decode(
         ? static_cast<int>(std::clamp<int64_t>(target_splits, 1, max_possible_splits))
         : 1;
 
-    at::Tensor o = at::empty_like(q);
     at::Tensor o_part;
     at::Tensor lse_part;
     float* o_part_ptr = nullptr;
@@ -711,7 +758,8 @@ at::Tensor fused_mha_varlen_decode(
     const auto* q_ptr = reinterpret_cast<const cutlass::half_t*>(q.data_ptr<at::Half>());
     const auto* k_ptr = reinterpret_cast<const cutlass::half_t*>(k_cache.data_ptr<at::Half>());
     const auto* v_ptr = reinterpret_cast<const cutlass::half_t*>(v_cache.data_ptr<at::Half>());
-    const int32_t* cu_k_ptr = cu_seqlens_k.data_ptr<int32_t>();
+    const int32_t* bt_ptr = block_table.data_ptr<int32_t>();
+    const int32_t* seqlens_ptr = cache_seqlens.data_ptr<int32_t>();
     const cutlass::half_t* cos_ptr = has_rope
         ? reinterpret_cast<const cutlass::half_t*>(cos->data_ptr<at::Half>())
         : nullptr;
@@ -720,6 +768,12 @@ at::Tensor fused_mha_varlen_decode(
         : nullptr;
     const int32_t* offsets_ptr = offsets.has_value() ? offsets->data_ptr<int32_t>() : nullptr;
     auto* o_ptr = reinterpret_cast<cutlass::half_t*>(o.data_ptr<at::Half>());
+
+    const int64_t q_stride_b = q.stride(0);
+    const int64_t q_stride_h = q.stride(1);
+    const int64_t o_stride_b = o.stride(0);
+    const int64_t o_stride_h = o.stride(1);
+    const int max_pages_per_seq = static_cast<int>(block_table.size(1));
 
     auto launch_decode_main = [&](auto has_rope_tag, auto use_splitk_tag) {
         constexpr bool K_ROPE = decltype(has_rope_tag)::value;
@@ -735,17 +789,22 @@ at::Tensor fused_mha_varlen_decode(
             q_ptr,
             k_ptr,
             v_ptr,
-            cu_k_ptr,
+            bt_ptr,
+            seqlens_ptr,
             cos_ptr,
             sin_ptr,
             offsets_ptr,
             o_part_ptr,
             lse_part_ptr,
             o_ptr,
+            q_stride_b,
+            q_stride_h,
+            o_stride_b,
+            o_stride_h,
             static_cast<int>(H_q),
             static_cast<int>(H_kv),
             static_cast<int>(B),
-            static_cast<int>(Total_Lk),
+            max_pages_per_seq,
             num_splits,
             sm_scale);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -778,15 +837,39 @@ at::Tensor fused_mha_varlen_decode(
             o_part_ptr,
             lse_part_ptr,
             o_ptr,
+            o_stride_b,
+            o_stride_h,
             static_cast<int>(B),
             num_splits);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-        // Release temporary Split-K buffers
         o_part = at::Tensor();
         lse_part = at::Tensor();
     }
+}
 
-    // 3. Return output
+// Public host wrapper for fused_mha_varlen_decode.
+// Returns o: (B, H_q, 64) [FP16].
+
+at::Tensor fused_mha_varlen_decode(
+    const at::Tensor& q,                              // (B, H_q, 64) [FP16]
+    const at::Tensor& k_cache,                        // (num_pages, 16, H_kv, 64) [FP16]
+    const at::Tensor& v_cache,                        // (num_pages, 16, H_kv, 64) [FP16]
+    const at::Tensor& block_table,                    // (B, max_pages_per_seq) [Int32]
+    const at::Tensor& cache_seqlens,                  // (B,) [Int32]
+    int64_t max_seqlen_k,                             // scalar [int64]
+    const std::optional<at::Tensor>& cos,             // (L_max, 64) [FP16] (optional)
+    const std::optional<at::Tensor>& sin,             // (L_max, 64) [FP16] (optional)
+    const std::optional<at::Tensor>& offsets,         // (B,) [Int32] (optional)
+    std::optional<bool> use_splitk                    // scalar [optional<bool>]
+) {
+    TORCH_CHECK(q.dim() == 3, "q must be a 3D tensor (B, H_q, 64)");
+    at::Tensor o = at::empty({q.size(0), q.size(1), 64}, q.options());
+
+    launch_fused_mha_varlen_decode_into(
+        q, k_cache, v_cache, block_table, cache_seqlens,
+        max_seqlen_k, o, cos, sin, offsets, use_splitk
+    );
+
     return o;
 }

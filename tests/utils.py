@@ -71,11 +71,11 @@ def generate_varlen_seqlens(
 
 def pack_varlen_tensor(padded_tensor: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
     """
-    Pack a padded batch tensor into contiguous packed varlen layout.
+    Pack a padded batch tensor into contiguous packed varlen THD layout.
 
     Supports:
         - (B, L_max, D)    -> (Total_L, D)
-        - (B, H, L_max, D) -> (H, Total_L, D)
+        - (B, L_max, H, D) -> (Total_L, H, D)
     """
     batch_size = int(cu_seqlens.shape[0]) - 1
     if padded_tensor.dim() == 3:
@@ -89,12 +89,12 @@ def pack_varlen_tensor(padded_tensor: torch.Tensor, cu_seqlens: torch.Tensor) ->
 
     if padded_tensor.dim() == 4:
         chunks = [
-            padded_tensor[i, :, : int(cu_seqlens[i + 1].item() - cu_seqlens[i].item())]
+            padded_tensor[i, : int(cu_seqlens[i + 1].item() - cu_seqlens[i].item())]
             for i in range(batch_size)
         ]
         if not chunks:
-            return padded_tensor.new_empty((padded_tensor.shape[1], 0, padded_tensor.shape[-1]))
-        return torch.cat(chunks, dim=1).contiguous()
+            return padded_tensor.new_empty((0, padded_tensor.shape[2], padded_tensor.shape[3]))
+        return torch.cat(chunks, dim=0).contiguous()
 
     raise ValueError(f"Expected 3D or 4D padded_tensor, got shape {tuple(padded_tensor.shape)}")
 
@@ -105,11 +105,11 @@ def unpack_varlen_tensor(
     max_seqlen: int,
 ) -> torch.Tensor:
     """
-    Unpack a packed varlen tensor back into zero-padded batched layout.
+    Unpack a packed varlen THD tensor back into zero-padded batched layout.
 
     Supports:
         - (Total_L, D)    -> (B, max_seqlen, D)
-        - (H, Total_L, D) -> (B, H, max_seqlen, D)
+        - (Total_L, H, D) -> (B, max_seqlen, H, D)
     """
     batch_size = int(cu_seqlens.shape[0]) - 1
     if packed_tensor.dim() == 2:
@@ -124,14 +124,14 @@ def unpack_varlen_tensor(
 
     if packed_tensor.dim() == 3:
         out = packed_tensor.new_zeros(
-            (batch_size, packed_tensor.shape[0], max_seqlen, packed_tensor.shape[-1])
+            (batch_size, max_seqlen, packed_tensor.shape[1], packed_tensor.shape[2])
         )
         for i in range(batch_size):
             start = int(cu_seqlens[i].item())
             end = int(cu_seqlens[i + 1].item())
             length = end - start
             if length > 0:
-                out[i, :, :length] = packed_tensor[:, start:end]
+                out[i, :length] = packed_tensor[start:end]
         return out
 
     raise ValueError(f"Expected 2D or 3D packed_tensor, got shape {tuple(packed_tensor.shape)}")
