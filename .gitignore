@@ -20,9 +20,10 @@ __pycache__/
 # Standalone root cutlass scratch directory (submodule third_party/cutlass is tracked)
 /cutlass/
 
-# Local prompt, checkpoints, and Nsight Compute profiles (do not publish)
+# Local prompt, checkpoints, design notes, and Nsight Compute profiles (do not publish)
 Prompt/
 prompt/
+design.md
 *.ncu-rep
 .ipynb_checkpoints/
 .vscode/
